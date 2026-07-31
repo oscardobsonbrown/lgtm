@@ -2136,6 +2136,18 @@ fn find_open_pr_item(items: &[ReviewItem], repo: &str, number: u64) -> Option<us
     })
 }
 
+fn pr_status_color(state: &gh::PrState, is_draft: bool) -> gpui::Rgba {
+    if is_draft {
+        return theme::pr_draft();
+    }
+    match state {
+        gh::PrState::Open => theme::pr_open(),
+        gh::PrState::Merged => theme::pr_merged(),
+        gh::PrState::Closed => theme::pr_closed(),
+        gh::PrState::Unknown(_) => theme::pr_draft(),
+    }
+}
+
 impl ReviewItem {
     fn primary(&self) -> SharedString {
         match &self.source {
@@ -2165,14 +2177,13 @@ impl ReviewItem {
         match &self.source {
             Source::Local(_) => theme::blue(),
             Source::Pr(_) => match &self.state {
-                ItemState::Ready(data) => match data.pr_meta.as_ref().map(|m| m.state.as_str()) {
-                    Some("OPEN") => theme::green(),
-                    Some("MERGED") => theme::mauve(),
-                    Some("CLOSED") => theme::red(),
-                    _ => theme::overlay0(),
-                },
+                ItemState::Ready(data) => data
+                    .pr_meta
+                    .as_ref()
+                    .map(|meta| pr_status_color(&meta.state, meta.is_draft))
+                    .unwrap_or_else(theme::pr_draft),
                 ItemState::Failed(_) => theme::red(),
-                ItemState::Loading => theme::overlay0(),
+                ItemState::Loading => theme::pr_draft(),
             },
         }
     }
@@ -2546,11 +2557,15 @@ fn app_title(detail: Option<String>) -> gpui::AnyElement {
 }
 
 fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
-    let (state_color, state_label) = match meta.state.as_str() {
-        "OPEN" => (theme::green(), "open"),
-        "MERGED" => (theme::mauve(), "merged"),
-        "CLOSED" => (theme::red(), "closed"),
-        other => (theme::overlay0(), other),
+    let (state_color, state_label) = if meta.is_draft {
+        (theme::pr_draft(), "draft")
+    } else {
+        match &meta.state {
+            gh::PrState::Open => (theme::pr_open(), "open"),
+            gh::PrState::Merged => (theme::pr_merged(), "merged"),
+            gh::PrState::Closed => (theme::pr_closed(), "closed"),
+            gh::PrState::Unknown(other) => (theme::pr_draft(), other.as_str()),
+        }
     };
     let state: Hsla = state_color.into();
     // The PR's overall review decision, when it has one.
@@ -2760,11 +2775,7 @@ fn palette_pr_row(
     selected: bool,
     entity: gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
-    let dot = if pr.is_draft {
-        theme::overlay0()
-    } else {
-        theme::green()
-    };
+    let dot = pr_status_color(&gh::PrState::Open, pr.is_draft);
     div()
         .id(("palette-pr", pos))
         .mx_1()
@@ -6808,6 +6819,14 @@ mod tests {
     }
 
     #[test]
+    fn pr_status_colors_follow_github_primer() {
+        assert_eq!(pr_status_color(&gh::PrState::Open, false), theme::pr_open());
+        assert_eq!(pr_status_color(&gh::PrState::Closed, false), theme::pr_closed());
+        assert_eq!(pr_status_color(&gh::PrState::Merged, false), theme::pr_merged());
+        assert_eq!(pr_status_color(&gh::PrState::Open, true), theme::pr_draft());
+    }
+
+    #[test]
     fn repo_slug_parsing() {
         assert_eq!(
             parse_repo_slug("BurntSushi/ripgrep"),
@@ -7580,6 +7599,7 @@ mod tests {
             title: "Fix the frobnicator".into(),
             author: gh::Author { login: "alice".into() },
             state: gh::PrState::Open,
+            is_draft: false,
             url: "https://github.com/o/r/pull/7".into(),
             body: "It was broken.\n".into(),
             base_ref_name: "main".into(),

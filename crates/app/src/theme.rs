@@ -41,6 +41,20 @@ pub fn peach() -> Rgba {
     rgb(0xfab387)
 }
 
+// GitHub Primer dark-theme foreground tokens for pull request state.
+pub fn pr_open() -> Rgba {
+    rgb(0x3fb950)
+}
+pub fn pr_draft() -> Rgba {
+    rgb(0x9198a1)
+}
+pub fn pr_closed() -> Rgba {
+    rgb(0xf85149)
+}
+pub fn pr_merged() -> Rgba {
+    rgb(0xab7df8)
+}
+
 /// Override gpui-component's theme (dark mode, default shadcn palette) with
 /// Catppuccin Mocha. Call after `gpui_component::init`.
 pub fn apply_ui_theme(cx: &mut App) {

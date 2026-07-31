@@ -33,6 +33,8 @@ pub struct PrMeta {
     pub title: String,
     pub author: Author,
     pub state: PrState,
+    #[serde(default)]
+    pub is_draft: bool,
     pub url: String,
     #[serde(default)]
     pub body: String,
@@ -103,7 +105,7 @@ fn locator_in_cwd_repo(number: u64) -> Result<PrLocator> {
 pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
     let json = run_gh(&[
         "pr", "view", &loc.number.to_string(), "--repo", &loc.repo_slug(), "--json",
-        "number,title,author,state,url,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles,reviewDecision",
+        "number,title,author,state,isDraft,url,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles,reviewDecision",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr view JSON")
 }

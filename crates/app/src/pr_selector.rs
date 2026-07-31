@@ -1,4 +1,4 @@
-use super::{find_open_pr_item, theme, ItemState, ReviewApp, Source};
+use super::{find_open_pr_item, pr_status_color, theme, ItemState, ReviewApp, Source};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{div, prelude::*, px, uniform_list, Context, Hsla, ScrollStrategy, SharedString, UniformListScrollHandle};
 use gpui_component::{
@@ -145,16 +145,15 @@ fn selector_entries(
             title: pr.title.clone().into(),
             subtitle: format!("{}#{} · @{}", pr.repository.name_with_owner, pr.number, pr.author.login).into(),
             search: pr_search(pr),
-            dot: open.map_or_else(
-                || {
-                    if pr.is_draft {
-                        theme::overlay0()
-                    } else {
-                        theme::green()
-                    }
-                },
-                |item| item.dot_color(),
-            ),
+            dot: open
+                .and_then(|item| match &item.state {
+                    ItemState::Ready(data) => data.pr_meta.as_ref(),
+                    _ => None,
+                })
+                .map_or_else(
+                    || pr_status_color(&gh::PrState::Open, pr.is_draft),
+                    |meta| pr_status_color(&meta.state, meta.is_draft),
+                ),
             action: EntryAction::PullRequest {
                 repo: pr.repository.name_with_owner.clone(),
                 number: pr.number,
