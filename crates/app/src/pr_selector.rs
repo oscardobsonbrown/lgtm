@@ -1,4 +1,4 @@
-use super::{theme, ReviewApp};
+use super::{find_open_pr_item, theme, ItemState, ReviewApp, Source};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{div, prelude::*, px, uniform_list, Context, Hsla, ScrollStrategy, SharedString, UniformListScrollHandle};
 use gpui_component::{
@@ -85,21 +85,156 @@ pub(crate) fn fuzzy_indices<T>(items: &[T], query: &str, text: impl Fn(&T) -> St
     scored.into_iter().map(|(_, index)| index).collect()
 }
 
-fn filter(rows: &[gh::UserPrSummary], query: &str) -> Vec<usize> {
-    fuzzy_indices(rows, query, |pr| {
-        format!(
-            "{} #{} {} {}",
-            pr.repository.name_with_owner, pr.number, pr.title, pr.author.login
-        )
-    })
+#[derive(Clone)]
+enum EntryAction {
+    PullRequest { repo: String, number: u64 },
+    OpenItem { id: u64 },
 }
 
-fn render_row(pr: &gh::UserPrSummary, pos: usize, entity: gpui::Entity<ReviewApp>) -> gpui::AnyElement {
-    let repo = pr.repository.name_with_owner.clone();
-    let number = pr.number;
-    let dot = if pr.is_draft { theme::overlay0() } else { theme::green() };
+#[derive(Clone)]
+enum EntryStatus {
+    Ready { additions: u32, deletions: u32 },
+    Loading,
+    Failed,
+}
+
+#[derive(Clone)]
+struct SelectorEntry {
+    title: SharedString,
+    subtitle: SharedString,
+    search: String,
+    dot: gpui::Rgba,
+    action: EntryAction,
+    open_item: Option<u64>,
+    active: bool,
+    status: Option<EntryStatus>,
+}
+
+fn item_status(state: &ItemState) -> EntryStatus {
+    match state {
+        ItemState::Ready(data) => EntryStatus::Ready {
+            additions: data.additions,
+            deletions: data.deletions,
+        },
+        ItemState::Loading => EntryStatus::Loading,
+        ItemState::Failed(_) => EntryStatus::Failed,
+    }
+}
+
+fn pr_search(pr: &gh::UserPrSummary) -> String {
+    format!(
+        "{} #{} {} {}",
+        pr.repository.name_with_owner, pr.number, pr.title, pr.author.login
+    )
+}
+
+fn selector_entries(
+    pull_requests: &[gh::UserPrSummary],
+    items: &[super::ReviewItem],
+    active: usize,
+) -> Vec<SelectorEntry> {
+    let mut entries = Vec::with_capacity(pull_requests.len() + items.len());
+    let mut represented_items = std::collections::HashSet::new();
+    for pr in pull_requests {
+        let open_ix = find_open_pr_item(items, &pr.repository.name_with_owner, pr.number);
+        let open = open_ix.map(|ix| &items[ix]);
+        if let Some(item) = open {
+            represented_items.insert(item.id);
+        }
+        entries.push(SelectorEntry {
+            title: pr.title.clone().into(),
+            subtitle: format!("{}#{} · @{}", pr.repository.name_with_owner, pr.number, pr.author.login).into(),
+            search: pr_search(pr),
+            dot: open.map_or_else(
+                || {
+                    if pr.is_draft {
+                        theme::overlay0()
+                    } else {
+                        theme::green()
+                    }
+                },
+                |item| item.dot_color(),
+            ),
+            action: EntryAction::PullRequest {
+                repo: pr.repository.name_with_owner.clone(),
+                number: pr.number,
+            },
+            open_item: open.map(|item| item.id),
+            active: open_ix == Some(active),
+            status: open.map(|item| item_status(&item.state)),
+        });
+    }
+    for (ix, item) in items.iter().enumerate() {
+        if represented_items.contains(&item.id) {
+            continue;
+        }
+        let primary = item.primary();
+        let secondary = item.secondary();
+        let (title, subtitle) = match &item.source {
+            Source::Pr(_) if !secondary.is_empty() => (secondary.clone(), primary.clone()),
+            _ => (primary.clone(), secondary.clone()),
+        };
+        entries.push(SelectorEntry {
+            title,
+            subtitle,
+            search: format!("{primary} {secondary}"),
+            dot: item.dot_color(),
+            action: EntryAction::OpenItem { id: item.id },
+            open_item: Some(item.id),
+            active: ix == active,
+            status: Some(item_status(&item.state)),
+        });
+    }
+    entries
+}
+
+impl ReviewApp {
+    fn selector_entries(&self) -> Vec<SelectorEntry> {
+        selector_entries(&self.pr_selector.rows, &self.items, self.active)
+    }
+}
+
+fn render_status(status: &EntryStatus) -> gpui::AnyElement {
+    match status {
+        EntryStatus::Ready { additions, deletions } => div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_shrink_0()
+            .text_size(px(10.))
+            .child(
+                div()
+                    .text_color(theme::green())
+                    .child(SharedString::from(format!("+{additions}"))),
+            )
+            .child(
+                div()
+                    .text_color(theme::red())
+                    .child(SharedString::from(format!("−{deletions}"))),
+            )
+            .into_any_element(),
+        EntryStatus::Loading => div()
+            .flex_shrink_0()
+            .text_size(px(10.))
+            .text_color(theme::overlay0())
+            .child("loading…")
+            .into_any_element(),
+        EntryStatus::Failed => div()
+            .flex_shrink_0()
+            .text_size(px(10.))
+            .text_color(theme::red())
+            .child("failed")
+            .into_any_element(),
+    }
+}
+
+fn render_row(entry: &SelectorEntry, pos: usize, entity: gpui::Entity<ReviewApp>) -> gpui::AnyElement {
+    let action = entry.action.clone();
+    let open_item = entry.open_item;
+    let activate_entity = entity.clone();
     div()
         .id(("user-pr", pos))
+        .group("selector-row")
         .mx_1()
         .px_2()
         .h(px(ROW_HEIGHT))
@@ -108,40 +243,68 @@ fn render_row(pr: &gh::UserPrSummary, pos: usize, entity: gpui::Entity<ReviewApp
         .items_center()
         .gap_2()
         .cursor_pointer()
+        .when(entry.active, |row| row.bg(theme::surface0()))
         .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-        .on_click(move |_, window, cx| entity.update(cx, |app, cx| app.open_or_activate_pr(&repo, number, window, cx)))
-        .child(div().w(px(8.)).h(px(8.)).flex_shrink_0().rounded_full().bg(dot))
+        .on_click(move |_, window, cx| {
+            activate_entity.update(cx, |app, cx| match &action {
+                EntryAction::PullRequest { repo, number } => app.open_or_activate_pr(repo, *number, window, cx),
+                EntryAction::OpenItem { id } => {
+                    if let Some(ix) = app.items.iter().position(|item| item.id == *id) {
+                        app.activate(ix, window, cx);
+                    }
+                }
+            })
+        })
+        .child(div().w(px(8.)).h(px(8.)).flex_shrink_0().rounded_full().bg(entry.dot))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .truncate()
-                        .text_color(theme::text())
-                        .child(SharedString::from(pr.title.clone())),
-                )
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(10.))
-                        .text_color(theme::subtext())
-                        .child(SharedString::from(format!(
-                            "{}#{} · @{}",
-                            pr.repository.name_with_owner, pr.number, pr.author.login
-                        ))),
-                ),
+                .child(div().truncate().text_color(theme::text()).child(entry.title.clone()))
+                .when(!entry.subtitle.is_empty(), |column| {
+                    column.child(
+                        div()
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(theme::subtext())
+                            .child(entry.subtitle.clone()),
+                    )
+                }),
         )
+        .when_some(entry.status.as_ref(), |row, status| row.child(render_status(status)))
+        .when_some(open_item, |row, id| {
+            row.child(
+                div()
+                    .flex_shrink_0()
+                    .opacity(0.)
+                    .group_hover("selector-row", |style| style.opacity(1.))
+                    .child(
+                        Button::new(("close-selector-item", id))
+                            .icon(IconName::Close)
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, _, cx| {
+                                entity.update(cx, |app, cx| {
+                                    if let Some(ix) = app.items.iter().position(|item| item.id == id) {
+                                        app.close_item(ix, cx);
+                                    }
+                                })
+                            }),
+                    ),
+            )
+        })
         .into_any_element()
 }
 
 impl ReviewApp {
     pub(super) fn render_user_pr_selector(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let query = self.open_input.read(cx).value().to_string();
-        let filtered = filter(&self.pr_selector.rows, &query);
+        let entries = self.selector_entries();
+        let filtered = fuzzy_indices(&entries, &query, |entry| entry.search.clone());
         let count = filtered.len();
+        let has_entries = !entries.is_empty();
         let entity = cx.entity();
         let expanded = self.pr_selector.expanded;
         let loading = matches!(self.pr_selector.phase, RefreshPhase::Loading { .. });
@@ -149,7 +312,7 @@ impl ReviewApp {
             RefreshPhase::Failed { message, .. } => Some(message.clone()),
             _ => None,
         };
-        let total = self.pr_selector.rows.len();
+        let total = entries.len();
         let header = div()
             .h(px(30.))
             .px_2()
@@ -181,7 +344,7 @@ impl ReviewApp {
                             .truncate()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(theme::subtext())
-                            .child(SharedString::from(format!("Pull requests ({total})"))),
+                            .child(SharedString::from(format!("Changes ({total})"))),
                     ),
             )
             .child(
@@ -194,14 +357,14 @@ impl ReviewApp {
             );
         let body = if !expanded {
             div().into_any_element()
-        } else if self.pr_selector.rows.is_empty() && loading {
+        } else if !has_entries && loading {
             div()
                 .px_3()
                 .py_2()
                 .text_color(theme::overlay0())
                 .child("loading pull requests…")
                 .into_any_element()
-        } else if self.pr_selector.rows.is_empty() {
+        } else if !has_entries {
             error.clone().map_or_else(
                 || {
                     div()
@@ -232,11 +395,10 @@ impl ReviewApp {
             div()
                 .h(px(count.min(5) as f32 * ROW_HEIGHT))
                 .child(
-                    uniform_list("user-pr-list", count, move |range, _, cx| {
-                        let app = entity.read(cx);
+                    uniform_list("user-pr-list", count, move |range, _, _cx| {
                         range
-                            .filter_map(|pos| Some((pos, app.pr_selector.rows.get(*filtered.get(pos)?)?)))
-                            .map(|(pos, pr)| render_row(pr, pos, entity.clone()))
+                            .filter_map(|pos| Some((pos, entries.get(*filtered.get(pos)?)?)))
+                            .map(|(pos, entry)| render_row(entry, pos, entity.clone()))
                             .collect()
                     })
                     .track_scroll(self.pr_selector.scroll.clone())
@@ -250,7 +412,7 @@ impl ReviewApp {
             .border_color(theme::surface0())
             .child(header)
             .child(body)
-            .when(expanded && !self.pr_selector.rows.is_empty(), |section| {
+            .when(expanded && has_entries, |section| {
                 section.when_some(error, |section, error| {
                     section.child(
                         div()
@@ -268,44 +430,5 @@ impl ReviewApp {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn row(number: u64) -> gh::UserPrSummary {
-        gh::UserPrSummary {
-            number,
-            title: "selector".into(),
-            author: gh::Author { login: "alice".into() },
-            is_draft: false,
-            updated_at: "now".into(),
-            repository: gh::Repository {
-                name: "r".into(),
-                name_with_owner: "a/r".into(),
-            },
-            url: "u".into(),
-        }
-    }
-
-    #[test]
-    fn refresh_state_keeps_rows_on_failure_and_discards_stale_results() {
-        let mut selector = PrSelector::new();
-        let first = selector.begin_refresh();
-        let second = selector.begin_refresh();
-        assert!(!selector.apply_result(first, Ok(vec![row(1)])));
-        assert!(selector.apply_result(second, Ok(vec![row(2)])));
-        let third = selector.begin_refresh();
-        assert!(selector.apply_result(third, Err(anyhow::anyhow!("offline"))));
-        assert_eq!(selector.rows[0].number, 2);
-        assert!(matches!(selector.phase, RefreshPhase::Failed { .. }));
-    }
-
-    #[test]
-    fn loaded_empty_and_filter_fields_are_explicit() {
-        let mut selector = PrSelector::new();
-        let request = selector.begin_refresh();
-        selector.apply_result(request, Ok(Vec::new()));
-        assert!(selector.rows.is_empty());
-        assert_eq!(filter(&[row(10)], "#10"), vec![0]);
-        assert_eq!(filter(&[row(10)], "alice"), vec![0]);
-    }
-}
+#[path = "pr_selector_tests.rs"]
+mod tests;

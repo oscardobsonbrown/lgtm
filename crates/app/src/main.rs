@@ -7,7 +7,7 @@ use anyhow::anyhow;
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
+    actions, canvas, div, fill, font, point, prelude::*, px, size, uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy,
@@ -5518,113 +5518,6 @@ impl ReviewApp {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Item counts are small: a plain scrollable div capped at ~40% of the
-        // sidebar leaves the rest for the active item's file tree.
-        let mut list = div()
-            .id("sidebar-items")
-            .max_h(relative(0.4))
-            .flex_shrink_0()
-            .overflow_y_scroll()
-            .py_1();
-        for (ix, item) in self.items.iter().enumerate() {
-            let active = ix == self.active;
-            let dot: Hsla = item.dot_color().into();
-            let status: gpui::AnyElement = match &item.state {
-                ItemState::Ready(data) => div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .child(
-                        div()
-                            .text_color(theme::green())
-                            .child(SharedString::from(format!("+{}", data.additions))),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme::red())
-                            .child(SharedString::from(format!("−{}", data.deletions))),
-                    )
-                    .into_any_element(),
-                ItemState::Loading => div()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("loading…"))
-                    .into_any_element(),
-                ItemState::Failed(_) => div()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .text_color(theme::red())
-                    .child(SharedString::from("failed"))
-                    .into_any_element(),
-            };
-            let secondary = item.secondary();
-            let entry = div()
-                .id(("item", ix))
-                .group("sidebar-item")
-                .mx_1()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .when(active, |entry| entry.bg(theme::surface0()))
-                .when(!active, |entry| {
-                    entry.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-                })
-                .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(8.))
-                                .h(px(8.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .bg(dot),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(theme::text())
-                                .child(item.primary()),
-                        )
-                        .child(status)
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .opacity(0.)
-                                .group_hover("sidebar-item", |style| style.opacity(1.))
-                                .child(
-                                    Button::new(("close-item", ix))
-                                        .icon(IconName::Close)
-                                        .ghost()
-                                        .xsmall()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.close_item(ix, cx)
-                                        })),
-                                ),
-                        ),
-                )
-                .when(!secondary.is_empty(), |entry| {
-                    entry.child(
-                        div()
-                            .pl(px(16.))
-                            .truncate()
-                            .text_size(px(11.))
-                            .text_color(theme::subtext())
-                            .child(secondary),
-                    )
-                });
-            list = list.child(entry);
-        }
-
         // --- file tree for the active item ---
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
         let mut tree_rows: Vec<TreeListRow> = Vec::new();
@@ -5735,8 +5628,6 @@ impl ReviewApp {
                     }),
             )
             .child(self.render_user_pr_selector(cx))
-            .child(list)
-            .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0()))
             .child(
                 div()
                     .flex_1()
