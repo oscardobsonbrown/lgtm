@@ -1,10 +1,13 @@
+mod preview;
+mod pr_selector;
+mod merge_dialog;
 mod theme;
 
 use anyhow::anyhow;
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
+    actions, canvas, div, fill, font, point, prelude::*, px, size, uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy,
@@ -38,6 +41,7 @@ const TEXT_SIZE: f32 = 13.0;
 const UNIFIED_GUTTER: f32 = 44. + 44. + 28.;
 const SPLIT_GUTTER: f32 = 44. + 28.;
 const SPLIT_DIVIDER: f32 = 6.0;
+const USER_PRS_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60);
 
 actions!(
     lgtm,
@@ -2118,6 +2122,30 @@ struct ReviewItem {
     /// Bumped whenever fresh data is installed; an in-flight Phase-2 upgrade
     /// only lands if the generation it captured is still current.
     upgrade_gen: u64,
+    preview: Option<preview::PreviewItem>,
+}
+
+fn find_open_pr_item(items: &[ReviewItem], repo: &str, number: u64) -> Option<usize> {
+    let (owner, repo_name) = repo.split_once('/')?;
+    items.iter().position(|item| {
+        matches!(
+            &item.source,
+            Source::Pr(loc)
+                if loc.owner == owner && loc.repo == repo_name && loc.number == number
+        )
+    })
+}
+
+fn pr_status_color(state: &gh::PrState, is_draft: bool) -> gpui::Rgba {
+    if is_draft {
+        return theme::pr_draft();
+    }
+    match state {
+        gh::PrState::Open => theme::pr_open(),
+        gh::PrState::Merged => theme::pr_merged(),
+        gh::PrState::Closed => theme::pr_closed(),
+        gh::PrState::Unknown(_) => theme::pr_draft(),
+    }
 }
 
 impl ReviewItem {
@@ -2149,14 +2177,13 @@ impl ReviewItem {
         match &self.source {
             Source::Local(_) => theme::blue(),
             Source::Pr(_) => match &self.state {
-                ItemState::Ready(data) => match data.pr_meta.as_ref().map(|m| m.state.as_str()) {
-                    Some("OPEN") => theme::green(),
-                    Some("MERGED") => theme::mauve(),
-                    Some("CLOSED") => theme::red(),
-                    _ => theme::overlay0(),
-                },
+                ItemState::Ready(data) => data
+                    .pr_meta
+                    .as_ref()
+                    .map(|meta| pr_status_color(&meta.state, meta.is_draft))
+                    .unwrap_or_else(theme::pr_draft),
                 ItemState::Failed(_) => theme::red(),
-                ItemState::Loading => theme::overlay0(),
+                ItemState::Loading => theme::pr_draft(),
             },
         }
     }
@@ -2173,6 +2200,7 @@ impl ReviewItem {
             mut hunk_rows,
             mode,
             comments,
+            preview: _,
         } = loaded;
         let (additions, deletions) = diff
             .files
@@ -2271,12 +2299,17 @@ struct Loaded {
     mode: ViewMode,
     /// Some (possibly empty) for PR items, None for local ones.
     comments: Option<CommentIndex>,
+    preview: Option<preview::PreviewGeneration>,
 }
 
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
 /// PR items fetch meta, patch, and review comments concurrently.
-fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
+fn fetch_item(
+    source: &Source,
+    mode: ViewMode,
+    preview: Option<preview::PreviewGeneration>,
+) -> anyhow::Result<Loaded> {
     let (meta, patch, comments) = match source {
         Source::Pr(loc) => {
             let meta_loc = loc.clone();
@@ -2284,13 +2317,34 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
             let comments_loc = loc.clone();
             let comments_thread =
                 std::thread::spawn(move || gh::fetch_review_comments(&comments_loc));
-            let patch = gh::fetch_patch(loc)?;
+            let patch = gh::fetch_patch(loc);
             let meta = meta_thread
                 .join()
                 .map_err(|_| anyhow!("gh metadata fetch panicked"))??;
             let comments = comments_thread
                 .join()
                 .map_err(|_| anyhow!("gh comments fetch panicked"))??;
+            let patch = match patch {
+                Ok(patch) => patch,
+                Err(err) if gh::is_diff_too_large_error(&err) => {
+                    eprintln!(
+                        "lgtm: GitHub diff too large for {}; building a local preview…",
+                        loc.repo_slug()
+                    );
+                    let destination = preview.as_ref().ok_or_else(|| anyhow!("missing PR preview generation"))?.repo_path();
+                    let patch = gh::fetch_patch_locally(loc, &meta, &destination).map_err(
+                        |fallback| {
+                            anyhow!(
+                                "GitHub's diff is too large, and the local preview failed: \
+                                 {fallback:#}"
+                            )
+                        },
+                    )?;
+                    eprintln!("lgtm: local preview ready for {}", loc.repo_slug());
+                    patch
+                }
+                Err(err) => return Err(err),
+            };
             (LoadedMeta::Pr(meta), patch, Some(group_comments(comments)))
         }
         Source::Local(src) => {
@@ -2310,6 +2364,7 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
         hunk_rows,
         mode,
         comments,
+        preview,
     })
 }
 
@@ -2329,6 +2384,7 @@ enum UpgradeSource {
         loc: gh::PrLocator,
         base_oid: String,
         head_oid: String,
+        preview: preview::PreviewGeneration,
     },
     Local(git::LocalSource),
 }
@@ -2386,9 +2442,9 @@ fn run_upgrade(source: &UpgradeSource, mut jobs: Vec<UpgradeJob>) -> Vec<Upgrade
 /// binary/non-UTF-8, over the size cap, or a fetch failure.
 fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
     let text = match source {
-        UpgradeSource::Pr { loc, base_oid, head_oid } => {
+        UpgradeSource::Pr { loc, base_oid, head_oid, preview } => {
             let oid = if old { base_oid } else { head_oid };
-            match gh::fetch_file_at(loc, oid, path) {
+            match gh::fetch_file_at_in(loc, oid, path, &preview.blob_path()) {
                 Ok(text) => text?,
                 Err(err) => {
                     eprintln!("lgtm: {path}: {err:#}");
@@ -2501,11 +2557,15 @@ fn app_title(detail: Option<String>) -> gpui::AnyElement {
 }
 
 fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::AnyElement {
-    let (state_color, state_label) = match meta.state.as_str() {
-        "OPEN" => (theme::green(), "open"),
-        "MERGED" => (theme::mauve(), "merged"),
-        "CLOSED" => (theme::red(), "closed"),
-        other => (theme::overlay0(), other),
+    let (state_color, state_label) = if meta.is_draft {
+        (theme::pr_draft(), "draft")
+    } else {
+        match &meta.state {
+            gh::PrState::Open => (theme::pr_open(), "open"),
+            gh::PrState::Merged => (theme::pr_merged(), "merged"),
+            gh::PrState::Closed => (theme::pr_closed(), "closed"),
+            gh::PrState::Unknown(other) => (theme::pr_draft(), other.as_str()),
+        }
     };
     let state: Hsla = state_color.into();
     // The PR's overall review decision, when it has one.
@@ -2585,7 +2645,7 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                         .xsmall()
                         .on_click(move |_, _, cx| cx.open_url(&url)),
                 )
-                .when(meta.state == "OPEN", |row| {
+                .when(meta.state == gh::PrState::Open && meta.review_decision != gh::ReviewDecision::Approved, |row| {
                     row.child(
                         Button::new("submit-review")
                             .label("Review")
@@ -2593,6 +2653,17 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                             .xsmall()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_review(window, cx);
+                            })),
+                    )
+                })
+                .when(meta.state == gh::PrState::Open && meta.review_decision == gh::ReviewDecision::Approved, |row| {
+                    row.child(
+                        Button::new("merge-pr")
+                            .label("Merge")
+                            .success()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_merge(window, cx);
                             })),
                     )
                 }),
@@ -2692,24 +2763,8 @@ fn filtered_sources(query: &str) -> Vec<usize> {
 /// Fuzzy-filter PRs against `#number title author branch`, best score first;
 /// an empty query keeps gh's original (most recently updated) order.
 fn filter_prs(all: &[gh::PrSummary], query: &str) -> Vec<usize> {
-    let query = query.trim();
-    if query.is_empty() {
-        return (0..all.len()).collect();
-    }
-    let matcher = SkimMatcherV2::default();
-    let mut scored: Vec<(i64, usize)> = all
-        .iter()
-        .enumerate()
-        .filter_map(|(ix, pr)| {
-            let haystack = format!(
-                "#{} {} {} {}",
-                pr.number, pr.title, pr.author.login, pr.head_ref_name
-            );
-            matcher.fuzzy_match(&haystack, query).map(|score| (score, ix))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, ix)| ix).collect()
+    pr_selector::fuzzy_indices(all, query, |pr| format!("#{} {} {} {}", pr.number,
+        pr.title, pr.author.login, pr.head_ref_name))
 }
 
 /// One row of the palette's PR list: state dot, #number, title, author, head
@@ -2720,11 +2775,7 @@ fn palette_pr_row(
     selected: bool,
     entity: gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
-    let dot = if pr.is_draft {
-        theme::overlay0()
-    } else {
-        theme::green()
-    };
+    let dot = pr_status_color(&gh::PrState::Open, pr.is_draft);
     div()
         .id(("palette-pr", pos))
         .mx_1()
@@ -3083,11 +3134,13 @@ enum ExplorePlan {
 }
 
 struct ReviewApp {
+    preview_session: preview::PreviewSession,
     items: Vec<ReviewItem>,
     active: usize,
     sidebar_visible: bool,
     open_input: gpui::Entity<InputState>,
     open_error: Option<SharedString>,
+    pr_selector: pr_selector::PrSelector,
     /// Fuzzy filter over the active item's file tree (`/` focuses it).
     tree_filter_input: gpui::Entity<InputState>,
     focus_handle: FocusHandle,
@@ -3121,6 +3174,7 @@ struct ReviewApp {
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
+    merge: Option<merge_dialog::MergeDialog>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -3156,6 +3210,7 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let preview_session = preview::PreviewSession::new();
         let open_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let palette_input = cx.new(|cx| InputState::new(window, cx));
@@ -3173,10 +3228,14 @@ impl ReviewApp {
             cx.subscribe_in(
                 &open_input,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.submit_open(window, cx);
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.submit_open(window, cx),
+                    InputEvent::Change => {
+                        this.open_error = None;
+                        this.pr_selector.query_changed();
+                        cx.notify();
                     }
+                    _ => {}
                 },
             ),
             cx.subscribe_in(
@@ -3205,11 +3264,13 @@ impl ReviewApp {
             ),
         ];
         let mut this = Self {
+            preview_session,
             items: Vec::new(),
             active: 0,
             sidebar_visible: !errors.is_empty() || sources.len() != 1,
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
+            pr_selector: pr_selector::PrSelector::new(),
             tree_filter_input,
             focus_handle: cx.focus_handle(),
             next_id: 0,
@@ -3227,12 +3288,21 @@ impl ReviewApp {
             composer_gen: 0,
             review: None,
             review_gen: 0,
+            merge: None,
             _subscriptions,
         };
         for source in sources {
             this.open_item(source, cx);
         }
         this.active = 0;
+        this.refresh_user_prs(cx);
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(USER_PRS_REFRESH_INTERVAL).await;
+            if this.update(cx, |app, cx| app.refresh_user_prs(cx)).is_err() {
+                break;
+            }
+        })
+        .detach();
         this
     }
 
@@ -3317,6 +3387,8 @@ impl ReviewApp {
     fn open_item(&mut self, source: Source, cx: &mut Context<Self>) {
         let id = self.next_id;
         self.next_id += 1;
+        let mut preview = matches!(source, Source::Pr(_)).then(|| self.preview_session.item(id));
+        let generation = preview.as_mut().map(preview::PreviewItem::begin);
         self.items.push(ReviewItem {
             id,
             source: source.clone(),
@@ -3324,16 +3396,61 @@ impl ReviewApp {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
+            preview,
         });
         self.active = self.items.len() - 1;
-        Self::spawn_fetch(id, source, ViewMode::Split, cx);
+        Self::spawn_fetch(id, source, ViewMode::Split, generation, cx);
         cx.notify();
     }
 
-    fn spawn_fetch(id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
+    fn refresh_user_prs(&mut self, cx: &mut Context<Self>) {
+        let request = self.pr_selector.begin_refresh();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let fetched = cx.background_spawn(async move { gh::list_user_prs() }).await;
+            this.update(cx, |app, cx| {
+                if app.pr_selector.apply_result(request, fetched) { cx.notify(); }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_or_activate_pr(
+        &mut self,
+        repo: &str,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((owner, repo_name)) = repo.split_once('/') else {
+            return;
+        };
+        if let Some(ix) = find_open_pr_item(&self.items, repo, number) {
+            self.activate(ix, window, cx);
+            return;
+        }
+        self.open_item(
+            Source::Pr(gh::PrLocator {
+                owner: owner.to_string(),
+                repo: repo_name.to_string(),
+                number,
+            }),
+            cx,
+        );
+        window.focus(&self.focus_handle);
+    }
+
+    fn spawn_fetch(
+        id: u64,
+        source: Source,
+        mode: ViewMode,
+        preview: Option<preview::PreviewGeneration>,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { fetch_item(&source, mode) })
+                .background_spawn(async move { fetch_item(&source, mode, preview) })
                 .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
@@ -3342,6 +3459,11 @@ impl ReviewApp {
                 item.reloading = false;
                 match fetched {
                     Ok(loaded) => {
+                        if let (Some(owner), Some(generation)) =
+                            (&mut item.preview, loaded.preview.clone())
+                        {
+                            owner.activate(generation);
+                        }
                         item.install(loaded);
                         // Phase 2: after the instant patch-derived paint,
                         // upgrade every eligible file to full contents in the
@@ -3377,6 +3499,8 @@ impl ReviewApp {
                                         loc: loc.clone(),
                                         base_oid: meta.base_ref_oid.clone(),
                                         head_oid: meta.head_ref_oid.clone(),
+                                        preview: item.preview.as_ref().and_then(preview::PreviewItem::active)
+                                            .expect("loaded PR items own an active preview"),
                                     }),
                                 Source::Local(src) => Some(UpgradeSource::Local(src.clone())),
                             };
@@ -3417,13 +3541,13 @@ impl ReviewApp {
             let upgraded = cx
                 .background_spawn(async move { run_upgrade(&source, jobs) })
                 .await;
-            if upgraded.is_empty() {
-                return;
-            }
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
                     return;
                 };
+                if upgraded.is_empty() {
+                    return;
+                }
                 if item.upgrade_gen != gen {
                     return;
                 }
@@ -3833,7 +3957,8 @@ impl ReviewApp {
         }
         item.refresh_error = None;
         let (id, source) = (item.id, item.source.clone());
-        Self::spawn_fetch(id, source, mode, cx);
+        let generation = item.preview.as_mut().map(preview::PreviewItem::begin);
+        Self::spawn_fetch(id, source, mode, generation, cx);
         cx.notify();
     }
 
@@ -4302,13 +4427,107 @@ impl ReviewApp {
         .detach();
     }
 
+    fn open_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.active_item() else {
+            return;
+        };
+        let Source::Pr(loc) = &item.source else {
+            return;
+        };
+        let ItemState::Ready(data) = &item.state else {
+            return;
+        };
+        if data.pr_meta.as_ref().is_none_or(|meta| meta.state != gh::PrState::Open) {
+            return;
+        }
+        let (item_id, loc) = (item.id, loc.clone());
+        let request = self.next_id;
+        self.next_id += 1;
+        let dialog = merge_dialog::MergeDialog::new(item_id, request);
+        self.merge = Some(dialog);
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move { gh::fetch_merge_assessment(&loc) })
+                .await;
+            this.update_in(cx, |app, _window, cx| {
+                let Some(merge) = &mut app.merge else {
+                    return;
+                };
+                if merge.item_id == item_id && merge.apply_assessment(request, fetched) { cx.notify(); }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.merge.as_ref().is_some_and(merge_dialog::MergeDialog::is_submitting) {
+            return;
+        }
+        if self.merge.take().is_some() {
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
+    fn submit_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(merge) = &self.merge else {
+            return;
+        };
+        let Some(item) = self.items.iter().find(|item| item.id == merge.item_id) else {
+            return;
+        };
+        let Source::Pr(loc) = &item.source else {
+            return;
+        };
+        let loc = loc.clone();
+        let item_id = item.id;
+        let Some((assessment, method, delete_branch)) = self.merge.as_mut().and_then(merge_dialog::MergeDialog::begin_submit) else { return };
+        let head_oid = assessment.head_oid;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let merge_loc = loc.clone();
+            let result = cx
+                .background_spawn(async move {
+                    gh::merge_pr(&merge_loc, method, delete_branch, &head_oid)
+                })
+                .await;
+            this.update_in(cx, |app, window, cx| {
+                match result {
+                    Ok(()) => {
+                        app.merge = None;
+                        window.focus(&app.focus_handle);
+                        app.refetch_meta(item_id, loc, cx);
+                    }
+                    Err(err) => {
+                        if let Some(merge) = &mut app.merge {
+                            if merge.item_id == item_id { merge.submit_failed(format!("{err:#}")); }
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Refetch only the PR meta — the post-review counterpart of
     /// `refetch_comments`, so the titlebar reflects the new review decision
     /// without reloading the whole diff.
     fn refetch_meta(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+        let repo_slug = loc.repo_slug();
+        let number = loc.number;
         cx.spawn(async move |this, cx| {
             let fetched = cx.background_spawn(async move { gh::fetch_meta(&loc) }).await;
             this.update(cx, |app, cx| {
+                if fetched
+                    .as_ref()
+                    .is_ok_and(|meta| meta.state != gh::PrState::Open)
+                {
+                    app.pr_selector.remove(&repo_slug, number);
+                }
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
                     return;
                 };
@@ -5178,10 +5397,6 @@ impl ReviewApp {
             .into_any_element()
     }
 
-    /// The minimap column: precomputed, coalesced quad runs plus one
-    /// per-frame viewport rectangle, painted straight into a canvas (no text,
-    /// no per-row elements). Mouse-downs stop propagation here so the pane's
-    /// selection listeners never see them.
     fn render_minimap(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let entity = cx.entity();
         div()
@@ -5314,113 +5529,6 @@ impl ReviewApp {
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Item counts are small: a plain scrollable div capped at ~40% of the
-        // sidebar leaves the rest for the active item's file tree.
-        let mut list = div()
-            .id("sidebar-items")
-            .max_h(relative(0.4))
-            .flex_shrink_0()
-            .overflow_y_scroll()
-            .py_1();
-        for (ix, item) in self.items.iter().enumerate() {
-            let active = ix == self.active;
-            let dot: Hsla = item.dot_color().into();
-            let status: gpui::AnyElement = match &item.state {
-                ItemState::Ready(data) => div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .child(
-                        div()
-                            .text_color(theme::green())
-                            .child(SharedString::from(format!("+{}", data.additions))),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme::red())
-                            .child(SharedString::from(format!("−{}", data.deletions))),
-                    )
-                    .into_any_element(),
-                ItemState::Loading => div()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .text_color(theme::overlay0())
-                    .child(SharedString::from("loading…"))
-                    .into_any_element(),
-                ItemState::Failed(_) => div()
-                    .flex_shrink_0()
-                    .text_size(px(11.))
-                    .text_color(theme::red())
-                    .child(SharedString::from("failed"))
-                    .into_any_element(),
-            };
-            let secondary = item.secondary();
-            let entry = div()
-                .id(("item", ix))
-                .group("sidebar-item")
-                .mx_1()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .when(active, |entry| entry.bg(theme::surface0()))
-                .when(!active, |entry| {
-                    entry.hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-                })
-                .on_click(cx.listener(move |this, _, window, cx| this.activate(ix, window, cx)))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(8.))
-                                .h(px(8.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .bg(dot),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_color(theme::text())
-                                .child(item.primary()),
-                        )
-                        .child(status)
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .opacity(0.)
-                                .group_hover("sidebar-item", |style| style.opacity(1.))
-                                .child(
-                                    Button::new(("close-item", ix))
-                                        .icon(IconName::Close)
-                                        .ghost()
-                                        .xsmall()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.close_item(ix, cx)
-                                        })),
-                                ),
-                        ),
-                )
-                .when(!secondary.is_empty(), |entry| {
-                    entry.child(
-                        div()
-                            .pl(px(16.))
-                            .truncate()
-                            .text_size(px(11.))
-                            .text_color(theme::subtext())
-                            .child(secondary),
-                    )
-                });
-            list = list.child(entry);
-        }
-
         // --- file tree for the active item ---
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
         let mut tree_rows: Vec<TreeListRow> = Vec::new();
@@ -5530,8 +5638,7 @@ impl ReviewApp {
                         )
                     }),
             )
-            .child(list)
-            .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0()))
+            .child(self.render_user_pr_selector(cx))
             .child(
                 div()
                     .flex_1()
@@ -6083,6 +6190,9 @@ impl Render for ReviewApp {
             .when(self.review.is_some(), |root| {
                 root.child(self.render_review(cx))
             })
+            .when(self.merge.is_some(), |root| {
+                root.child(self.render_merge(cx))
+            })
             .when(self.palette.is_some(), |root| {
                 root.child(self.render_palette(cx))
             })
@@ -6509,7 +6619,6 @@ mod tests {
             author: gh::Author {
                 login: author.to_string(),
             },
-            state: "OPEN".to_string(),
             is_draft: false,
             head_ref_name: branch.to_string(),
             updated_at: "2026-07-01T00:00:00Z".to_string(),
@@ -6537,6 +6646,42 @@ mod tests {
         assert_eq!(filter_prs(&all, "bob"), vec![1]);
         assert_eq!(filter_prs(&all, "crash"), vec![0]);
         assert!(filter_prs(&all, "zzzqqq").is_empty());
+    }
+
+    #[test]
+    fn existing_pr_lookup_prevents_duplicate_open_items() {
+        let items = vec![
+            ReviewItem {
+                id: 1,
+                source: Source::Pr(gh::PrLocator {
+                    owner: "ellie".to_string(),
+                    repo: "lgtm".to_string(),
+                    number: 8,
+                }),
+                state: ItemState::Loading,
+                reloading: false,
+                refresh_error: None,
+                upgrade_gen: 0,
+                preview: None,
+            },
+            ReviewItem {
+                id: 2,
+                source: Source::Local(git::LocalSource {
+                    branch: "feature".to_string(),
+                    base_label: "main".to_string(),
+                    base_oid: None,
+                    repo_root: std::path::PathBuf::from("/tmp/repo"),
+                }),
+                state: ItemState::Loading,
+                reloading: false,
+                refresh_error: None,
+                upgrade_gen: 0,
+                preview: None,
+            },
+        ];
+        assert_eq!(find_open_pr_item(&items, "ellie/lgtm", 8), Some(0));
+        assert_eq!(find_open_pr_item(&items, "ellie/lgtm", 9), None);
+        assert_eq!(find_open_pr_item(&items, "invalid", 8), None);
     }
 
     /// (depth, display name, Some(file_ix) for files / None for dirs).
@@ -6671,6 +6816,14 @@ mod tests {
             ("renamed", theme::mauve())
         );
         assert_eq!(status_style(FileStatus::Binary), ("binary", theme::peach()));
+    }
+
+    #[test]
+    fn pr_status_colors_follow_github_primer() {
+        assert_eq!(pr_status_color(&gh::PrState::Open, false), theme::pr_open());
+        assert_eq!(pr_status_color(&gh::PrState::Closed, false), theme::pr_closed());
+        assert_eq!(pr_status_color(&gh::PrState::Merged, false), theme::pr_merged());
+        assert_eq!(pr_status_color(&gh::PrState::Open, true), theme::pr_draft());
     }
 
     #[test]
@@ -7445,7 +7598,8 @@ mod tests {
             number: 7,
             title: "Fix the frobnicator".into(),
             author: gh::Author { login: "alice".into() },
-            state: "OPEN".into(),
+            state: gh::PrState::Open,
+            is_draft: false,
             url: "https://github.com/o/r/pull/7".into(),
             body: "It was broken.\n".into(),
             base_ref_name: "main".into(),
@@ -7455,7 +7609,7 @@ mod tests {
             additions: 1,
             deletions: 2,
             changed_files: 3,
-            review_decision: String::new(),
+            review_decision: gh::ReviewDecision::default(),
         };
         let header = pr_chat_header(&meta);
         assert!(header.contains("\"Fix the frobnicator\""));
