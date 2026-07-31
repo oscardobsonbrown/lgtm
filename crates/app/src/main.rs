@@ -4430,8 +4430,9 @@ impl ReviewApp {
             return;
         }
         let (item_id, loc) = (item.id, loc.clone());
-        let dialog = merge_dialog::MergeDialog::new(item_id);
-        let request = dialog.request();
+        let request = self.next_id;
+        self.next_id += 1;
+        let dialog = merge_dialog::MergeDialog::new(item_id, request);
         self.merge = Some(dialog);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -6716,7 +6717,6 @@ mod tests {
             author: gh::Author {
                 login: author.to_string(),
             },
-            state: "OPEN".to_string(),
             is_draft: false,
             head_ref_name: branch.to_string(),
             updated_at: "2026-07-01T00:00:00Z".to_string(),

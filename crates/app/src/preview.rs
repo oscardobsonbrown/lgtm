@@ -108,11 +108,7 @@ fn cleanup_stale_sessions(parent: &Path, current_pid: u32, mut alive: impl FnMut
         return;
     };
     for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse().ok())
-        else {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse().ok()) else {
             continue;
         };
         if pid != current_pid && !alive(pid) {

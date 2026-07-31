@@ -14,43 +14,13 @@ impl PrLocator {
     }
 }
 
-macro_rules! string_enum {
-    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub enum $name { $($variant,)+ Unknown(String) }
-
-        impl Default for $name {
-            fn default() -> Self { Self::Unknown(String::new()) }
-        }
-
-        impl $name {
-            pub fn as_str(&self) -> &str {
-                match self { $(Self::$variant => $value,)+ Self::Unknown(value) => value }
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(self.as_str())
-            }
-        }
-
-        impl<'de> serde::Deserialize<'de> for $name {
-            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let value = String::deserialize(deserializer)?;
-                Ok(match value.as_str() { $($value => Self::$variant,)+ _ => Self::Unknown(value) })
-            }
-        }
-    };
-}
-
-string_enum!(PrState {
+remote_enum!(PrState {
     Open => "OPEN",
     Closed => "CLOSED",
     Merged => "MERGED",
 });
 
-string_enum!(ReviewDecision {
+remote_enum!(ReviewDecision {
     Approved => "APPROVED",
     ChangesRequested => "CHANGES_REQUESTED",
     ReviewRequired => "REVIEW_REQUIRED",
@@ -96,23 +66,17 @@ pub fn resolve_pr_arg(arg: &str) -> Result<PrLocator> {
             return Ok(PrLocator {
                 owner: parts[0].to_string(),
                 repo: parts[1].to_string(),
-                number: digits
-                    .parse()
-                    .with_context(|| format!("no PR number in URL {arg}"))?,
+                number: digits.parse().with_context(|| format!("no PR number in URL {arg}"))?,
             });
         }
         bail!("unrecognized GitHub URL: {arg}");
     }
     if let Some((repo, number)) = arg.split_once('#') {
-        let number = number
-            .parse()
-            .with_context(|| format!("invalid PR number in {arg}"))?;
+        let number = number.parse().with_context(|| format!("invalid PR number in {arg}"))?;
         if repo.is_empty() {
             return locator_in_cwd_repo(number);
         }
-        let (owner, repo) = repo
-            .split_once('/')
-            .context("expected owner/repo before '#'")?;
+        let (owner, repo) = repo.split_once('/').context("expected owner/repo before '#'")?;
         return Ok(PrLocator {
             owner: owner.into(),
             repo: repo.into(),
@@ -126,19 +90,9 @@ pub fn resolve_pr_arg(arg: &str) -> Result<PrLocator> {
 }
 
 fn locator_in_cwd_repo(number: u64) -> Result<PrLocator> {
-    let out = run_gh(&[
-        "repo",
-        "view",
-        "--json",
-        "nameWithOwner",
-        "--jq",
-        ".nameWithOwner",
-    ])
-    .context("couldn't infer the repo from the current directory; use owner/repo#123")?;
-    let (owner, repo) = out
-        .trim()
-        .split_once('/')
-        .context("unexpected gh repo view output")?;
+    let out = run_gh(&["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+        .context("couldn't infer the repo from the current directory; use owner/repo#123")?;
+    let (owner, repo) = out.trim().split_once('/').context("unexpected gh repo view output")?;
     Ok(PrLocator {
         owner: owner.into(),
         repo: repo.into(),
@@ -162,9 +116,7 @@ mod tests {
     fn parses_locators() {
         assert_eq!(resolve_pr_arg("ellie/lgtm#8").unwrap().number, 8);
         assert_eq!(
-            resolve_pr_arg("https://github.com/ellie/lgtm/pull/9")
-                .unwrap()
-                .repo,
+            resolve_pr_arg("https://github.com/ellie/lgtm/pull/9").unwrap().repo,
             "lgtm"
         );
         assert!(resolve_pr_arg("garbage").is_err());

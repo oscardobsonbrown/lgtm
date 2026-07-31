@@ -11,7 +11,6 @@ pub(crate) enum MergePhase {
         assessment: gh::MergeAssessment,
     },
     Failed {
-        request: u64,
         message: String,
     },
 }
@@ -21,32 +20,19 @@ pub(crate) struct MergeDialog {
     pub(crate) method: gh::MergeMethod,
     pub(crate) delete_branch: bool,
     pub(crate) phase: MergePhase,
-    next_request: u64,
 }
 
 impl MergeDialog {
-    pub(crate) fn new(item_id: u64) -> Self {
+    pub(crate) fn new(item_id: u64, request: u64) -> Self {
         Self {
             item_id,
             method: gh::MergeMethod::Squash,
             delete_branch: false,
-            phase: MergePhase::Checking { request: 1 },
-            next_request: 1,
+            phase: MergePhase::Checking { request },
         }
     }
 
-    pub(crate) fn request(&self) -> u64 {
-        match self.phase {
-            MergePhase::Checking { request } | MergePhase::Failed { request, .. } => request,
-            _ => self.next_request,
-        }
-    }
-
-    pub(crate) fn apply_assessment(
-        &mut self,
-        request: u64,
-        result: anyhow::Result<gh::MergeAssessment>,
-    ) -> bool {
+    pub(crate) fn apply_assessment(&mut self, request: u64, result: anyhow::Result<gh::MergeAssessment>) -> bool {
         if !matches!(self.phase, MergePhase::Checking { request: active } if active == request) {
             return false;
         }
@@ -56,7 +42,6 @@ impl MergeDialog {
                 error: None,
             },
             Err(error) => MergePhase::Failed {
-                request,
                 message: format!("{error:#}"),
             },
         };
@@ -97,11 +82,7 @@ impl ReviewApp {
         let Some(dialog) = &self.merge else {
             return empty();
         };
-        let Some(item) = self
-            .items
-            .get(self.active)
-            .filter(|item| item.id == dialog.item_id)
-        else {
+        let Some(item) = self.items.get(self.active).filter(|item| item.id == dialog.item_id) else {
             return empty();
         };
         let ItemState::Ready(data) = &item.state else {
@@ -130,8 +111,7 @@ impl ReviewApp {
                         .text_color(theme::mauve())
                 })
                 .when(value != selected, |row| {
-                    row.border_color(theme::surface0())
-                        .text_color(theme::subtext())
+                    row.border_color(theme::surface0()).text_color(theme::subtext())
                 })
                 .on_click(cx.listener(move |app, _, _, cx| {
                     if let Some(dialog) = &mut app.merge {
@@ -152,7 +132,7 @@ impl ReviewApp {
                     .child("checking GitHub merge state…")
                     .into_any_element(),
             ),
-            MergePhase::Failed { message, .. } => (
+            MergePhase::Failed { message } => (
                 false,
                 div()
                     .text_color(theme::red())
@@ -160,7 +140,11 @@ impl ReviewApp {
                     .into_any_element(),
             ),
             MergePhase::Assessed { assessment, .. } | MergePhase::Submitting { assessment } => {
-                let passing = assessment.checks_with(gh::CheckState::Passing).count();
+                let passing = assessment
+                    .checks
+                    .iter()
+                    .filter(|check| check.state == gh::CheckState::Passing)
+                    .count();
                 let mut area = div().flex().flex_col().gap_1().child(
                     div()
                         .text_color(if assessment.merge_state == gh::MergeState::Clean {
@@ -198,8 +182,7 @@ impl ReviewApp {
                             ))),
                     );
                 }
-                if assessment.merge_state != gh::MergeState::Clean
-                    && assessment.merge_state != gh::MergeState::HasHooks
+                if assessment.merge_state != gh::MergeState::Clean && assessment.merge_state != gh::MergeState::HasHooks
                 {
                     area = area.child(
                         div()
@@ -230,9 +213,7 @@ impl ReviewApp {
                 div()
                     .w(px(560.))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_action(
-                        cx.listener(|app, _: &InputEscape, window, cx| app.close_merge(window, cx)),
-                    )
+                    .on_action(cx.listener(|app, _: &InputEscape, window, cx| app.close_merge(window, cx)))
                     .rounded_lg()
                     .border_1()
                     .border_color(theme::surface0())
@@ -243,27 +224,16 @@ impl ReviewApp {
                     .flex_col()
                     .gap_2()
                     .text_size(px(12.))
-                    .child(
-                        div()
-                            .text_color(theme::overlay0())
-                            .child("Merge pull request"),
-                    )
+                    .child(div().text_color(theme::overlay0()).child("Merge pull request"))
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(SharedString::from(format!(
-                                "#{} {}",
-                                meta.number, meta.title
-                            ))),
+                            .child(SharedString::from(format!("#{} {}", meta.number, meta.title))),
                     )
-                    .child(
-                        div()
-                            .text_color(theme::subtext())
-                            .child(SharedString::from(format!(
-                                "{} → {}",
-                                meta.head_ref_name, meta.base_ref_name
-                            ))),
-                    )
+                    .child(div().text_color(theme::subtext()).child(SharedString::from(format!(
+                        "{} → {}",
+                        meta.head_ref_name, meta.base_ref_name
+                    ))))
                     .child(status)
                     .child(
                         div()
@@ -308,9 +278,7 @@ impl ReviewApp {
                                     .ghost()
                                     .small()
                                     .disabled(submitting)
-                                    .on_click(cx.listener(|app, _, window, cx| {
-                                        app.close_merge(window, cx)
-                                    })),
+                                    .on_click(cx.listener(|app, _, window, cx| app.close_merge(window, cx))),
                             )
                             .child(
                                 Button::new("merge-confirm")
@@ -319,9 +287,7 @@ impl ReviewApp {
                                     .small()
                                     .disabled(!can_attempt || submitting)
                                     .loading(submitting)
-                                    .on_click(cx.listener(|app, _, window, cx| {
-                                        app.submit_merge(window, cx)
-                                    })),
+                                    .on_click(cx.listener(|app, _, window, cx| app.submit_merge(window, cx))),
                             ),
                     ),
             )
@@ -345,31 +311,30 @@ mod tests {
     }
 
     #[test]
-    fn stale_assessments_do_not_replace_current_state() {
-        let mut dialog = MergeDialog::new(1);
-        assert!(!dialog.apply_assessment(9, Ok(assessment(gh::ReviewDecision::Approved, "a"))));
+    fn reopened_dialog_rejects_the_prior_request() {
+        let mut dialog = MergeDialog::new(1, 2);
+        assert!(!dialog.apply_assessment(1, Ok(assessment(gh::ReviewDecision::Approved, "old"))));
         assert!(matches!(dialog.phase, MergePhase::Checking { .. }));
+        assert!(dialog.apply_assessment(2, Ok(assessment(gh::ReviewDecision::Approved, "current"))));
+        assert!(matches!(dialog.phase, MergePhase::Assessed { .. }));
     }
 
     #[test]
     fn submit_failure_returns_to_assessed_for_retry() {
-        let mut dialog = MergeDialog::new(1);
+        let mut dialog = MergeDialog::new(1, 1);
         dialog.apply_assessment(1, Ok(assessment(gh::ReviewDecision::Approved, "a")));
         assert!(dialog.begin_submit().is_some());
         assert!(dialog.is_submitting());
         dialog.submit_failed("blocked".into());
-        assert!(matches!(
-            dialog.phase,
-            MergePhase::Assessed { error: Some(_), .. }
-        ));
+        assert!(matches!(dialog.phase, MergePhase::Assessed { error: Some(_), .. }));
     }
 
     #[test]
     fn revoked_approval_or_missing_head_prevents_attempt() {
-        let mut dialog = MergeDialog::new(1);
+        let mut dialog = MergeDialog::new(1, 1);
         dialog.apply_assessment(1, Ok(assessment(gh::ReviewDecision::ChangesRequested, "a")));
         assert!(dialog.begin_submit().is_none());
-        let mut dialog = MergeDialog::new(1);
+        let mut dialog = MergeDialog::new(1, 1);
         dialog.apply_assessment(1, Ok(assessment(gh::ReviewDecision::Approved, "")));
         assert!(dialog.begin_submit().is_none());
     }

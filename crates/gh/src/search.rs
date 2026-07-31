@@ -9,7 +9,6 @@ pub struct PrSummary {
     pub number: u64,
     pub title: String,
     pub author: Author,
-    pub state: String,
     pub is_draft: bool,
     pub head_ref_name: String,
     pub updated_at: String,
@@ -45,7 +44,7 @@ pub fn list_prs(owner: &str, repo: &str) -> Result<Vec<PrSummary>> {
         "--limit",
         "200",
         "--json",
-        "number,title,author,state,isDraft,headRefName,updatedAt",
+        "number,title,author,isDraft,headRefName,updatedAt",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr list JSON")
 }
@@ -79,11 +78,7 @@ fn merge_user_prs(left: Vec<UserPrSummary>, right: Vec<UserPrSummary>) -> Vec<Us
     prs.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
-            .then_with(|| {
-                a.repository
-                    .name_with_owner
-                    .cmp(&b.repository.name_with_owner)
-            })
+            .then_with(|| a.repository.name_with_owner.cmp(&b.repository.name_with_owner))
             .then_with(|| a.number.cmp(&b.number))
     });
     prs
@@ -93,9 +88,7 @@ pub fn list_user_prs() -> Result<Vec<UserPrSummary>> {
     list_user_prs_with(search_user_prs)
 }
 
-fn list_user_prs_with(
-    search: impl Fn(&str) -> Result<Vec<UserPrSummary>> + Sync,
-) -> Result<Vec<UserPrSummary>> {
+fn list_user_prs_with(search: impl Fn(&str) -> Result<Vec<UserPrSummary>> + Sync) -> Result<Vec<UserPrSummary>> {
     let (authored, requested) = std::thread::scope(|scope| {
         let authored = scope.spawn(|| search("--author=@me"));
         let requested = scope.spawn(|| search("--review-requested=@me"));
@@ -150,11 +143,7 @@ mod tests {
         let result = list_user_prs_with(|filter| {
             barrier.wait();
             Ok(vec![pr(
-                if filter.contains("author") {
-                    "a/r"
-                } else {
-                    "b/r"
-                },
+                if filter.contains("author") { "a/r" } else { "b/r" },
                 1,
                 "now",
             )])

@@ -25,8 +25,7 @@ pub fn fetch_review_comments(loc: &PrLocator) -> Result<Vec<ReviewComment>> {
             loc.owner, loc.repo, loc.number
         ),
     ])?;
-    let pages: Vec<Vec<ReviewComment>> =
-        serde_json::from_str(&json).context("unexpected gh pulls/comments JSON")?;
+    let pages: Vec<Vec<ReviewComment>> = serde_json::from_str(&json).context("unexpected gh pulls/comments JSON")?;
     Ok(pages.into_iter().flatten().collect())
 }
 
@@ -42,10 +41,7 @@ pub fn post_review_comment(
         "api",
         "-X",
         "POST",
-        &format!(
-            "repos/{}/{}/pulls/{}/comments",
-            loc.owner, loc.repo, loc.number
-        ),
+        &format!("repos/{}/{}/pulls/{}/comments", loc.owner, loc.repo, loc.number),
         "-f",
         &format!("body={body}"),
         "-f",

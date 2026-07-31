@@ -1,6 +1,6 @@
-use crate::command::{run_gh, run_git};
+use crate::command::{checked, run_gh, run_git, spawn};
 use crate::model::{PrLocator, PrMeta};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -8,13 +8,7 @@ use std::process::Command;
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
 
 pub fn fetch_patch(loc: &PrLocator) -> Result<String> {
-    run_gh(&[
-        "pr",
-        "diff",
-        &loc.number.to_string(),
-        "--repo",
-        &loc.repo_slug(),
-    ])
+    run_gh(&["pr", "diff", &loc.number.to_string(), "--repo", &loc.repo_slug()])
 }
 
 pub fn is_diff_too_large_error(err: &anyhow::Error) -> bool {
@@ -30,43 +24,26 @@ pub fn is_diff_too_large_error(err: &anyhow::Error) -> bool {
 /// creation and cleanup; this function never resets or removes the directory.
 pub fn fetch_patch_locally(loc: &PrLocator, meta: &PrMeta, destination: &Path) -> Result<String> {
     if destination.exists() {
-        bail!(
-            "preview destination already exists: {}",
-            destination.display()
-        );
+        bail!("preview destination already exists: {}", destination.display());
     }
     let repo_path = destination.to_string_lossy().into_owned();
-    let clone = Command::new("gh")
-        .args([
-            "repo",
-            "clone",
-            &loc.repo_slug(),
-            &repo_path,
-            "--",
-            "--bare",
-            "--filter=blob:none",
-            "--single-branch",
-            "--no-tags",
-        ])
-        .output()
-        .map_err(|err| anyhow!("failed to run gh: {err}"))?;
-    if !clone.status.success() {
-        bail!(
-            "gh repo clone {} failed: {}",
-            loc.repo_slug(),
-            String::from_utf8_lossy(&clone.stderr).trim()
-        );
-    }
+    let mut command = Command::new("gh");
+    command.args([
+        "repo",
+        "clone",
+        &loc.repo_slug(),
+        &repo_path,
+        "--",
+        "--bare",
+        "--filter=blob:none",
+        "--single-branch",
+        "--no-tags",
+    ]);
+    checked(command, &format!("gh repo clone {}", loc.repo_slug()))?;
     let base_ref = format!("+refs/heads/{}:refs/lgtm/base", meta.base_ref_name);
     let head_ref = format!("+refs/pull/{}/head:refs/lgtm/head", loc.number);
-    run_git(
-        destination,
-        &["fetch", "--no-tags", "origin", &base_ref, &head_ref],
-    )?;
-    let merge_base = run_git(
-        destination,
-        &["merge-base", "refs/lgtm/base", "refs/lgtm/head"],
-    )?;
+    run_git(destination, &["fetch", "--no-tags", "origin", &base_ref, &head_ref])?;
+    let merge_base = run_git(destination, &["merge-base", "refs/lgtm/base", "refs/lgtm/head"])?;
     run_git(
         destination,
         &[
@@ -84,12 +61,7 @@ pub fn fetch_file_at(loc: &PrLocator, commit_oid: &str, path: &str) -> Result<Op
     fetch_file_at_with_cache(loc, commit_oid, path, None)
 }
 
-pub fn fetch_file_at_in(
-    loc: &PrLocator,
-    commit_oid: &str,
-    path: &str,
-    cache_root: &Path,
-) -> Result<Option<String>> {
+pub fn fetch_file_at_in(loc: &PrLocator, commit_oid: &str, path: &str, cache_root: &Path) -> Result<Option<String>> {
     fetch_file_at_with_cache(loc, commit_oid, path, Some(cache_root))
 }
 
@@ -115,15 +87,9 @@ fn fetch_file_at_with_cache(
         encode_path(path),
         commit_oid
     );
-    let output = Command::new("gh")
-        .args([
-            "api",
-            "-H",
-            "Accept: application/vnd.github.raw+json",
-            &endpoint,
-        ])
-        .output()
-        .map_err(|err| anyhow!("failed to run gh: {err}"))?;
+    let mut command = Command::new("gh");
+    command.args(["api", "-H", "Accept: application/vnd.github.raw+json", &endpoint]);
+    let output = spawn(command, "gh api")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("404") {
@@ -166,20 +132,14 @@ pub fn cache_key(repo: &str, oid: &str, path: &str) -> String {
         hasher.update(value.as_bytes());
         hasher.update([0]);
     }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 pub fn encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
-                out.push(byte as char)
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => out.push(byte as char),
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -192,10 +152,8 @@ mod tests {
 
     #[test]
     fn recognizes_only_large_diff_errors() {
-        assert!(is_diff_too_large_error(&anyhow!(
-            "PullRequest.diff too_large"
-        )));
-        assert!(!is_diff_too_large_error(&anyhow!("bad credentials")));
+        assert!(is_diff_too_large_error(&anyhow::anyhow!("PullRequest.diff too_large")));
+        assert!(!is_diff_too_large_error(&anyhow::anyhow!("bad credentials")));
     }
 
     #[test]

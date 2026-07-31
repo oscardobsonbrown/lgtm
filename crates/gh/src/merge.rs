@@ -1,24 +1,7 @@
-use crate::command::run_gh;
+use crate::command::{checked, run_gh};
 use crate::model::{PrLocator, ReviewDecision};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use std::process::Command;
-
-macro_rules! remote_enum {
-    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub enum $name { $($variant,)+ Unknown(String) }
-        impl $name {
-            pub fn as_str(&self) -> &str {
-                match self { $(Self::$variant => $value,)+ Self::Unknown(value) => value }
-            }
-        }
-        impl From<String> for $name {
-            fn from(value: String) -> Self {
-                match value.as_str() { $($value => Self::$variant,)+ _ => Self::Unknown(value) }
-            }
-        }
-    };
-}
 
 remote_enum!(Mergeability {
     Mergeable => "MERGEABLE",
@@ -63,10 +46,6 @@ impl MergeAssessment {
     pub fn can_attempt(&self) -> bool {
         self.review_decision == ReviewDecision::Approved && !self.head_oid.is_empty()
     }
-
-    pub fn checks_with(&self, state: CheckState) -> impl Iterator<Item = &CheckSummary> {
-        self.checks.iter().filter(move |check| check.state == state)
-    }
 }
 
 #[derive(serde::Deserialize)]
@@ -110,10 +89,7 @@ fn normalize(raw: RawAssessment) -> MergeAssessment {
             } => {
                 let state = if status != "COMPLETED" {
                     CheckState::Pending
-                } else if matches!(
-                    conclusion.as_deref(),
-                    Some("SUCCESS" | "NEUTRAL" | "SKIPPED")
-                ) {
+                } else if matches!(conclusion.as_deref(), Some("SUCCESS" | "NEUTRAL" | "SKIPPED")) {
                     CheckState::Passing
                 } else {
                     CheckState::Failing
@@ -176,12 +152,7 @@ impl MergeMethod {
     }
 }
 
-fn merge_args(
-    loc: &PrLocator,
-    method: MergeMethod,
-    delete_branch: bool,
-    head_oid: &str,
-) -> Vec<String> {
+fn merge_args(loc: &PrLocator, method: MergeMethod, delete_branch: bool, head_oid: &str) -> Vec<String> {
     let mut args = vec![
         "pr".into(),
         "merge".into(),
@@ -198,25 +169,11 @@ fn merge_args(
     args
 }
 
-pub fn merge_pr(
-    loc: &PrLocator,
-    method: MergeMethod,
-    delete_branch: bool,
-    head_oid: &str,
-) -> Result<()> {
+pub fn merge_pr(loc: &PrLocator, method: MergeMethod, delete_branch: bool, head_oid: &str) -> Result<()> {
     let args = merge_args(loc, method, delete_branch, head_oid);
-    let output = Command::new("gh")
-        .args(&args)
-        .current_dir(std::env::temp_dir())
-        .output()
-        .map_err(|err| anyhow!("failed to run gh: {err}"))?;
-    if !output.status.success() {
-        bail!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    let mut command = Command::new("gh");
+    command.args(&args).current_dir(std::env::temp_dir());
+    checked(command, &format!("gh {}", args.join(" ")))?;
     Ok(())
 }
 

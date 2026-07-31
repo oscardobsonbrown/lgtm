@@ -1,9 +1,6 @@
 use super::{theme, ReviewApp};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
-use gpui::{
-    div, prelude::*, px, uniform_list, Context, Hsla, ScrollStrategy, SharedString,
-    UniformListScrollHandle,
-};
+use gpui::{div, prelude::*, px, uniform_list, Context, Hsla, ScrollStrategy, SharedString, UniformListScrollHandle};
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     IconName, Sizable as _,
@@ -15,7 +12,7 @@ const ROW_HEIGHT: f32 = 42.0;
 enum RefreshPhase {
     Idle,
     Loading { request: u64 },
-    Failed { request: u64, message: SharedString },
+    Failed { message: SharedString },
 }
 
 pub(crate) struct PrSelector {
@@ -45,11 +42,7 @@ impl PrSelector {
         self.next_request
     }
 
-    pub(crate) fn apply_result(
-        &mut self,
-        request: u64,
-        result: anyhow::Result<Vec<gh::UserPrSummary>>,
-    ) -> bool {
+    pub(crate) fn apply_result(&mut self, request: u64, result: anyhow::Result<Vec<gh::UserPrSummary>>) -> bool {
         if !matches!(self.phase, RefreshPhase::Loading { request: active } if active == request) {
             return false;
         }
@@ -60,7 +53,6 @@ impl PrSelector {
             }
             Err(error) => {
                 self.phase = RefreshPhase::Failed {
-                    request,
                     message: format!("{error:#}").into(),
                 }
             }
@@ -73,25 +65,12 @@ impl PrSelector {
             .retain(|pr| pr.number != number || pr.repository.name_with_owner != repo);
     }
 
-    pub(crate) fn is_loading(&self) -> bool {
-        matches!(self.phase, RefreshPhase::Loading { .. })
-    }
     pub(crate) fn query_changed(&self) {
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
-    fn error(&self) -> Option<SharedString> {
-        match &self.phase {
-            RefreshPhase::Failed { message, .. } => Some(message.clone()),
-            _ => None,
-        }
-    }
 }
 
-pub(crate) fn fuzzy_indices<T>(
-    items: &[T],
-    query: &str,
-    text: impl Fn(&T) -> String,
-) -> Vec<usize> {
+pub(crate) fn fuzzy_indices<T>(items: &[T], query: &str, text: impl Fn(&T) -> String) -> Vec<usize> {
     let query = query.trim();
     if query.is_empty() {
         return (0..items.len()).collect();
@@ -100,11 +79,7 @@ pub(crate) fn fuzzy_indices<T>(
     let mut scored: Vec<_> = items
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| {
-            matcher
-                .fuzzy_match(&text(item), query)
-                .map(|score| (score, index))
-        })
+        .filter_map(|(index, item)| matcher.fuzzy_match(&text(item), query).map(|score| (score, index)))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.into_iter().map(|(_, index)| index).collect()
@@ -119,18 +94,10 @@ fn filter(rows: &[gh::UserPrSummary], query: &str) -> Vec<usize> {
     })
 }
 
-fn render_row(
-    pr: &gh::UserPrSummary,
-    pos: usize,
-    entity: gpui::Entity<ReviewApp>,
-) -> gpui::AnyElement {
+fn render_row(pr: &gh::UserPrSummary, pos: usize, entity: gpui::Entity<ReviewApp>) -> gpui::AnyElement {
     let repo = pr.repository.name_with_owner.clone();
     let number = pr.number;
-    let dot = if pr.is_draft {
-        theme::overlay0()
-    } else {
-        theme::green()
-    };
+    let dot = if pr.is_draft { theme::overlay0() } else { theme::green() };
     div()
         .id(("user-pr", pos))
         .mx_1()
@@ -142,19 +109,8 @@ fn render_row(
         .gap_2()
         .cursor_pointer()
         .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-        .on_click(move |_, window, cx| {
-            entity.update(cx, |app, cx| {
-                app.open_or_activate_pr(&repo, number, window, cx)
-            })
-        })
-        .child(
-            div()
-                .w(px(8.))
-                .h(px(8.))
-                .flex_shrink_0()
-                .rounded_full()
-                .bg(dot),
-        )
+        .on_click(move |_, window, cx| entity.update(cx, |app, cx| app.open_or_activate_pr(&repo, number, window, cx)))
+        .child(div().w(px(8.)).h(px(8.)).flex_shrink_0().rounded_full().bg(dot))
         .child(
             div()
                 .flex_1()
@@ -188,8 +144,11 @@ impl ReviewApp {
         let count = filtered.len();
         let entity = cx.entity();
         let expanded = self.pr_selector.expanded;
-        let loading = self.pr_selector.is_loading();
-        let error = self.pr_selector.error();
+        let loading = matches!(self.pr_selector.phase, RefreshPhase::Loading { .. });
+        let error = match &self.pr_selector.phase {
+            RefreshPhase::Failed { message, .. } => Some(message.clone()),
+            _ => None,
+        };
         let total = self.pr_selector.rows.len();
         let header = div()
             .h(px(30.))
@@ -276,9 +235,7 @@ impl ReviewApp {
                     uniform_list("user-pr-list", count, move |range, _, cx| {
                         let app = entity.read(cx);
                         range
-                            .filter_map(|pos| {
-                                Some((pos, app.pr_selector.rows.get(*filtered.get(pos)?)?))
-                            })
+                            .filter_map(|pos| Some((pos, app.pr_selector.rows.get(*filtered.get(pos)?)?)))
                             .map(|(pos, pr)| render_row(pr, pos, entity.clone()))
                             .collect()
                     })
@@ -318,9 +275,7 @@ mod tests {
         gh::UserPrSummary {
             number,
             title: "selector".into(),
-            author: gh::Author {
-                login: "alice".into(),
-            },
+            author: gh::Author { login: "alice".into() },
             is_draft: false,
             updated_at: "now".into(),
             repository: gh::Repository {
@@ -341,7 +296,7 @@ mod tests {
         let third = selector.begin_refresh();
         assert!(selector.apply_result(third, Err(anyhow::anyhow!("offline"))));
         assert_eq!(selector.rows[0].number, 2);
-        assert!(selector.error().is_some());
+        assert!(matches!(selector.phase, RefreshPhase::Failed { .. }));
     }
 
     #[test]
