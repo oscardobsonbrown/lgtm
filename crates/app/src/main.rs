@@ -22,11 +22,13 @@ use gpui_component::{
     input::{Escape as InputEscape, Input, InputEvent, InputState},
     kbd::Kbd,
     scroll::Scrollbar,
+    spinner::Spinner,
     tag::Tag,
     Disableable as _, IconName, Root, Sizable as _, TitleBar,
 };
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 const MONO: &str = "Menlo";
 const ROW_HEIGHT: f32 = 22.0;
@@ -38,6 +40,8 @@ const TEXT_SIZE: f32 = 13.0;
 const UNIFIED_GUTTER: f32 = 44. + 44. + 28.;
 const SPLIT_GUTTER: f32 = 44. + 28.;
 const SPLIT_DIVIDER: f32 = 6.0;
+const USER_PRS_REFRESH_INTERVAL: Duration = Duration::from_secs(4 * 60);
+const USER_PR_ROW_HEIGHT: f32 = 42.0;
 
 actions!(
     lgtm,
@@ -2120,6 +2124,17 @@ struct ReviewItem {
     upgrade_gen: u64,
 }
 
+fn find_open_pr_item(items: &[ReviewItem], repo: &str, number: u64) -> Option<usize> {
+    let (owner, repo_name) = repo.split_once('/')?;
+    items.iter().position(|item| {
+        matches!(
+            &item.source,
+            Source::Pr(loc)
+                if loc.owner == owner && loc.repo == repo_name && loc.number == number
+        )
+    })
+}
+
 impl ReviewItem {
     fn primary(&self) -> SharedString {
         match &self.source {
@@ -2276,7 +2291,7 @@ struct Loaded {
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
 /// PR items fetch meta, patch, and review comments concurrently.
-fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
+fn fetch_item(item_id: u64, source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
     let (meta, patch, comments) = match source {
         Source::Pr(loc) => {
             let meta_loc = loc.clone();
@@ -2284,13 +2299,33 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
             let comments_loc = loc.clone();
             let comments_thread =
                 std::thread::spawn(move || gh::fetch_review_comments(&comments_loc));
-            let patch = gh::fetch_patch(loc)?;
+            let patch = gh::fetch_patch(loc);
             let meta = meta_thread
                 .join()
                 .map_err(|_| anyhow!("gh metadata fetch panicked"))??;
             let comments = comments_thread
                 .join()
                 .map_err(|_| anyhow!("gh comments fetch panicked"))??;
+            let patch = match patch {
+                Ok(patch) => patch,
+                Err(err) if gh::is_diff_too_large_error(&err) => {
+                    eprintln!(
+                        "lgtm: GitHub diff too large for {}; building a local preview…",
+                        loc.repo_slug()
+                    );
+                    let patch = gh::fetch_patch_locally(loc, &meta, &preview_item_root(item_id)).map_err(
+                        |fallback| {
+                            anyhow!(
+                                "GitHub's diff is too large, and the local preview failed: \
+                                 {fallback:#}"
+                            )
+                        },
+                    )?;
+                    eprintln!("lgtm: local preview ready for {}", loc.repo_slug());
+                    patch
+                }
+                Err(err) => return Err(err),
+            };
             (LoadedMeta::Pr(meta), patch, Some(group_comments(comments)))
         }
         Source::Local(src) => {
@@ -2329,6 +2364,7 @@ enum UpgradeSource {
         loc: gh::PrLocator,
         base_oid: String,
         head_oid: String,
+        cache_root: PathBuf,
     },
     Local(git::LocalSource),
 }
@@ -2386,9 +2422,9 @@ fn run_upgrade(source: &UpgradeSource, mut jobs: Vec<UpgradeJob>) -> Vec<Upgrade
 /// binary/non-UTF-8, over the size cap, or a fetch failure.
 fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
     let text = match source {
-        UpgradeSource::Pr { loc, base_oid, head_oid } => {
+        UpgradeSource::Pr { loc, base_oid, head_oid, cache_root } => {
             let oid = if old { base_oid } else { head_oid };
-            match gh::fetch_file_at(loc, oid, path) {
+            match gh::fetch_file_at_in(loc, oid, path, cache_root) {
                 Ok(text) => text?,
                 Err(err) => {
                     eprintln!("lgtm: {path}: {err:#}");
@@ -2585,7 +2621,7 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                         .xsmall()
                         .on_click(move |_, _, cx| cx.open_url(&url)),
                 )
-                .when(meta.state == "OPEN", |row| {
+                .when(meta.state == "OPEN" && meta.review_decision != "APPROVED", |row| {
                     row.child(
                         Button::new("submit-review")
                             .label("Review")
@@ -2593,6 +2629,17 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                             .xsmall()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_review(window, cx);
+                            })),
+                    )
+                })
+                .when(meta.state == "OPEN" && meta.review_decision == "APPROVED", |row| {
+                    row.child(
+                        Button::new("merge-pr")
+                            .label("Merge")
+                            .success()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_merge(window, cx);
                             })),
                     )
                 }),
@@ -2712,6 +2759,87 @@ fn filter_prs(all: &[gh::PrSummary], query: &str) -> Vec<usize> {
     scored.into_iter().map(|(_, ix)| ix).collect()
 }
 
+/// Fuzzy-filter the cross-repository sidebar list by repository, PR number,
+/// title, and author. An empty query keeps the latest-updated order.
+fn filter_user_prs(all: &[gh::UserPrSummary], query: &str) -> Vec<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        return (0..all.len()).collect();
+    }
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, usize)> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, pr)| {
+            let haystack = format!(
+                "{} #{} {} {}",
+                pr.repository.name_with_owner, pr.number, pr.title, pr.author.login
+            );
+            matcher.fuzzy_match(&haystack, query).map(|score| (score, ix))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, ix)| ix).collect()
+}
+
+fn render_user_pr_row(
+    pr: &gh::UserPrSummary,
+    pos: usize,
+    entity: gpui::Entity<ReviewApp>,
+) -> gpui::AnyElement {
+    let repo = pr.repository.name_with_owner.clone();
+    let number = pr.number;
+    let dot = if pr.is_draft { theme::overlay0() } else { theme::green() };
+    div()
+        .id(("user-pr", pos))
+        .mx_1()
+        .px_2()
+        .h(px(USER_PR_ROW_HEIGHT))
+        .rounded_md()
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+        .on_click(move |_, window, cx| {
+            entity.update(cx, |this, cx| {
+                this.open_or_activate_pr(&repo, number, window, cx)
+            });
+        })
+        .child(
+            div()
+                .w(px(8.))
+                .h(px(8.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(dot),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(theme::text())
+                        .child(SharedString::from(pr.title.clone())),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(theme::subtext())
+                        .child(SharedString::from(format!(
+                            "{}#{} · @{}",
+                            pr.repository.name_with_owner, pr.number, pr.author.login
+                        ))),
+                ),
+        )
+        .into_any_element()
+}
+
 /// One row of the palette's PR list: state dot, #number, title, author, head
 /// branch. Clicking opens the PR just like enter does.
 fn palette_pr_row(
@@ -2819,6 +2947,21 @@ struct ReviewDialog {
     error: Option<SharedString>,
     in_flight: bool,
     _subscription: Subscription,
+}
+
+enum MergeDialogStatus {
+    Loading,
+    Ready(gh::MergeStatus),
+    Failed(String),
+}
+
+struct MergeDialog {
+    item_id: u64,
+    method: gh::MergeMethod,
+    delete_branch: bool,
+    status: MergeDialogStatus,
+    error: Option<SharedString>,
+    in_flight: bool,
 }
 
 // --- Chat with Claude -------------------------------------------------------
@@ -3032,6 +3175,64 @@ fn chat_scratch_root(item_id: u64) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("lgtm-chat-{}-{item_id}", std::process::id()))
 }
 
+fn preview_parent_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".cache")
+        .join("lgtm")
+        .join("previews")
+}
+
+fn preview_session_root() -> PathBuf {
+    preview_parent_root().join(std::process::id().to_string())
+}
+
+fn preview_item_root(item_id: u64) -> PathBuf {
+    preview_session_root().join(item_id.to_string())
+}
+
+/// Remove preview sessions whose owner process no longer exists, then start
+/// this process with a clean session directory. `kill -0` only checks for a
+/// process; it does not send a signal.
+fn cleanup_stale_preview_sessions(
+    parent: &Path,
+    current_pid: u32,
+    mut is_alive: impl FnMut(u32) -> bool,
+) {
+    let _ = std::fs::create_dir_all(parent);
+    let _ = std::fs::remove_dir_all(parent.join(current_pid.to_string()));
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        if !is_alive(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+fn prepare_preview_session() {
+    cleanup_stale_preview_sessions(
+        &preview_parent_root(),
+        std::process::id(),
+        |pid| {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        },
+    );
+}
+
 /// A repo-relative path mapped under `root`, preserving the layout. Rejects
 /// absolute paths and any non-normal component (`..`, `.`) so materialized
 /// files can't escape the scratch dir.
@@ -3088,6 +3289,15 @@ struct ReviewApp {
     sidebar_visible: bool,
     open_input: gpui::Entity<InputState>,
     open_error: Option<SharedString>,
+    /// Cross-repository open PRs authored by the user or requesting review.
+    user_prs: Vec<gh::UserPrSummary>,
+    user_prs_loading: bool,
+    /// A refresh error. Existing results stay visible when this is set.
+    user_prs_error: Option<SharedString>,
+    user_prs_expanded: bool,
+    /// Drops results from an older manual or timed refresh.
+    user_prs_gen: u64,
+    user_prs_scroll: UniformListScrollHandle,
     /// Fuzzy filter over the active item's file tree (`/` focuses it).
     tree_filter_input: gpui::Entity<InputState>,
     focus_handle: FocusHandle,
@@ -3121,6 +3331,10 @@ struct ReviewApp {
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
+    merge: Option<MergeDialog>,
+    /// Bumped on each merge-dialog open/close to reject stale status and
+    /// submission results.
+    merge_gen: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -3156,6 +3370,7 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        prepare_preview_session();
         let open_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let palette_input = cx.new(|cx| InputState::new(window, cx));
@@ -3168,15 +3383,20 @@ impl ReviewApp {
                 for item in &this.items {
                     let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
                 }
+                let _ = std::fs::remove_dir_all(preview_session_root());
                 async {}
             }),
             cx.subscribe_in(
                 &open_input,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.submit_open(window, cx);
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter { .. } => this.submit_open(window, cx),
+                    InputEvent::Change => {
+                        this.open_error = None;
+                        this.user_prs_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                        cx.notify();
                     }
+                    _ => {}
                 },
             ),
             cx.subscribe_in(
@@ -3210,6 +3430,12 @@ impl ReviewApp {
             sidebar_visible: !errors.is_empty() || sources.len() != 1,
             open_input,
             open_error: errors.first().cloned().map(SharedString::from),
+            user_prs: Vec::new(),
+            user_prs_loading: false,
+            user_prs_error: None,
+            user_prs_expanded: true,
+            user_prs_gen: 0,
+            user_prs_scroll: UniformListScrollHandle::new(),
             tree_filter_input,
             focus_handle: cx.focus_handle(),
             next_id: 0,
@@ -3227,12 +3453,22 @@ impl ReviewApp {
             composer_gen: 0,
             review: None,
             review_gen: 0,
+            merge: None,
+            merge_gen: 0,
             _subscriptions,
         };
         for source in sources {
             this.open_item(source, cx);
         }
         this.active = 0;
+        this.refresh_user_prs(cx);
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(USER_PRS_REFRESH_INTERVAL).await;
+            if this.update(cx, |app, cx| app.refresh_user_prs(cx)).is_err() {
+                break;
+            }
+        })
+        .detach();
         this
     }
 
@@ -3330,13 +3566,69 @@ impl ReviewApp {
         cx.notify();
     }
 
+    fn refresh_user_prs(&mut self, cx: &mut Context<Self>) {
+        self.user_prs_gen += 1;
+        let gen = self.user_prs_gen;
+        self.user_prs_loading = true;
+        self.user_prs_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let fetched = cx.background_spawn(async move { gh::list_user_prs() }).await;
+            this.update(cx, |app, cx| {
+                if app.user_prs_gen != gen {
+                    return;
+                }
+                app.user_prs_loading = false;
+                match fetched {
+                    Ok(prs) => app.user_prs = prs,
+                    Err(err) => app.user_prs_error = Some(format!("{err:#}").into()),
+                }
+                let query = app.open_input.read(cx).value().to_string();
+                if filter_user_prs(&app.user_prs, &query).is_empty() {
+                    app.user_prs_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_or_activate_pr(
+        &mut self,
+        repo: &str,
+        number: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((owner, repo_name)) = repo.split_once('/') else {
+            return;
+        };
+        if let Some(ix) = find_open_pr_item(&self.items, repo, number) {
+            self.activate(ix, window, cx);
+            return;
+        }
+        self.open_item(
+            Source::Pr(gh::PrLocator {
+                owner: owner.to_string(),
+                repo: repo_name.to_string(),
+                number,
+            }),
+            cx,
+        );
+        window.focus(&self.focus_handle);
+    }
+
     fn spawn_fetch(id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { fetch_item(&source, mode) })
+                .background_spawn(async move { fetch_item(id, &source, mode) })
                 .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
+                    // The user closed the item while its fallback clone or
+                    // local diff was still running. Remove anything it made.
+                    let _ = std::fs::remove_dir_all(preview_item_root(id));
                     return;
                 };
                 item.reloading = false;
@@ -3377,6 +3669,7 @@ impl ReviewApp {
                                         loc: loc.clone(),
                                         base_oid: meta.base_ref_oid.clone(),
                                         head_oid: meta.head_ref_oid.clone(),
+                                        cache_root: preview_item_root(id).join("blobs"),
                                     }),
                                 Source::Local(src) => Some(UpgradeSource::Local(src.clone())),
                             };
@@ -3417,13 +3710,16 @@ impl ReviewApp {
             let upgraded = cx
                 .background_spawn(async move { run_upgrade(&source, jobs) })
                 .await;
-            if upgraded.is_empty() {
-                return;
-            }
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
+                    // A closed item can finish its worker pool after close_item
+                    // first removed the directory. Remove any late writes.
+                    let _ = std::fs::remove_dir_all(preview_item_root(id));
                     return;
                 };
+                if upgraded.is_empty() {
+                    return;
+                }
                 if item.upgrade_gen != gen {
                     return;
                 }
@@ -3801,6 +4097,9 @@ impl ReviewApp {
             data.chat.cancel.store(true, Ordering::Relaxed);
         }
         let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
+        // Only app-created PR fallback data lives here. LocalSource paths are
+        // never placed below this root and are never removed.
+        let _ = std::fs::remove_dir_all(preview_item_root(item.id));
         self.items.remove(ix);
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
@@ -4302,13 +4601,138 @@ impl ReviewApp {
         .detach();
     }
 
+    fn open_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.active_item() else {
+            return;
+        };
+        let Source::Pr(loc) = &item.source else {
+            return;
+        };
+        let ItemState::Ready(data) = &item.state else {
+            return;
+        };
+        if data.pr_meta.as_ref().is_none_or(|meta| meta.state != "OPEN") {
+            return;
+        }
+        let (item_id, loc) = (item.id, loc.clone());
+        self.merge_gen += 1;
+        let gen = self.merge_gen;
+        self.merge = Some(MergeDialog {
+            item_id,
+            method: gh::MergeMethod::Squash,
+            delete_branch: false,
+            status: MergeDialogStatus::Loading,
+            error: None,
+            in_flight: false,
+        });
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move { gh::fetch_merge_status(&loc) })
+                .await;
+            this.update_in(cx, |app, _window, cx| {
+                if app.merge_gen != gen {
+                    return;
+                }
+                let Some(merge) = &mut app.merge else {
+                    return;
+                };
+                merge.status = match fetched {
+                    Ok(status) => MergeDialogStatus::Ready(status),
+                    Err(err) => MergeDialogStatus::Failed(format!("{err:#}")),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn close_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.merge.take().is_some() {
+            self.merge_gen += 1;
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
+    fn submit_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(merge) = &self.merge else {
+            return;
+        };
+        if merge.in_flight {
+            return;
+        }
+        let MergeDialogStatus::Ready(status) = &merge.status else {
+            return;
+        };
+        if !status.can_merge() {
+            return;
+        }
+        let Some(item) = self.items.iter().find(|item| item.id == merge.item_id) else {
+            return;
+        };
+        let Source::Pr(loc) = &item.source else {
+            return;
+        };
+        let loc = loc.clone();
+        let item_id = item.id;
+        let method = merge.method;
+        let delete_branch = merge.delete_branch;
+        let head_oid = status.head_ref_oid.clone();
+        let gen = self.merge_gen;
+        if let Some(merge) = &mut self.merge {
+            merge.in_flight = true;
+            merge.error = None;
+        }
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let merge_loc = loc.clone();
+            let result = cx
+                .background_spawn(async move {
+                    gh::merge_pr(&merge_loc, method, delete_branch, &head_oid)
+                })
+                .await;
+            this.update_in(cx, |app, window, cx| {
+                if app.merge_gen != gen {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        app.close_merge(window, cx);
+                        app.refetch_meta(item_id, loc, cx);
+                    }
+                    Err(err) => {
+                        if let Some(merge) = &mut app.merge {
+                            merge.in_flight = false;
+                            merge.error = Some(format!("{err:#}").into());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Refetch only the PR meta — the post-review counterpart of
     /// `refetch_comments`, so the titlebar reflects the new review decision
     /// without reloading the whole diff.
     fn refetch_meta(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+        let repo_slug = loc.repo_slug();
+        let number = loc.number;
         cx.spawn(async move |this, cx| {
             let fetched = cx.background_spawn(async move { gh::fetch_meta(&loc) }).await;
             this.update(cx, |app, cx| {
+                if fetched
+                    .as_ref()
+                    .is_ok_and(|meta| meta.state != "OPEN")
+                {
+                    app.user_prs.retain(|pr| {
+                        pr.number != number || pr.repository.name_with_owner != repo_slug
+                    });
+                }
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
                     return;
                 };
@@ -5178,6 +5602,262 @@ impl ReviewApp {
             .into_any_element()
     }
 
+    fn render_merge(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let empty = || div().into_any_element();
+        let Some(merge) = &self.merge else {
+            return empty();
+        };
+        let Some(item) = self.items.get(self.active) else {
+            return empty();
+        };
+        if item.id != merge.item_id {
+            return empty();
+        }
+        let ItemState::Ready(data) = &item.state else {
+            return empty();
+        };
+        let Some(meta) = &data.pr_meta else {
+            return empty();
+        };
+        let selected = merge.method;
+        let method_option = |label: &'static str, method: gh::MergeMethod| {
+            div()
+                .id(label)
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .cursor_pointer()
+                .when(method == selected, |opt| {
+                    opt.bg(Hsla::from(theme::mauve()).opacity(0.15))
+                        .border_color(Hsla::from(theme::mauve()).opacity(0.6))
+                        .text_color(theme::mauve())
+                })
+                .when(method != selected, |opt| {
+                    opt.border_color(theme::surface0())
+                        .text_color(theme::subtext())
+                        .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(merge) = &mut this.merge {
+                        merge.method = method;
+                        merge.error = None;
+                        cx.notify();
+                    }
+                }))
+                .child(SharedString::from(label))
+        };
+        let (can_merge, status_area): (bool, gpui::AnyElement) = match &merge.status {
+            MergeDialogStatus::Loading => (
+                false,
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_2()
+                    .text_color(theme::overlay0())
+                    .child(Spinner::new().xsmall())
+                    .child(SharedString::from("checking approvals, checks, and conflicts…"))
+                    .into_any_element(),
+            ),
+            MergeDialogStatus::Failed(err) => (
+                false,
+                div()
+                    .py_2()
+                    .text_color(theme::red())
+                    .child(SharedString::from(err.clone()))
+                    .into_any_element(),
+            ),
+            MergeDialogStatus::Ready(status) => {
+                let blockers = status.blockers();
+                let mut area = div().py_1().flex().flex_col().gap_1().child(
+                    div()
+                        .text_color(if blockers.is_empty() {
+                            theme::green()
+                        } else {
+                            theme::red()
+                        })
+                        .child(SharedString::from(if blockers.is_empty() {
+                            format!(
+                                "Ready to merge · {} check{} passed",
+                                status.passing_checks,
+                                if status.passing_checks == 1 { "" } else { "s" }
+                            )
+                        } else {
+                            format!(
+                                "Merge blocked · GitHub state {}",
+                                status.merge_state_status.to_lowercase()
+                            )
+                        })),
+                );
+                for blocker in &blockers {
+                    area = area.child(
+                        div()
+                            .text_color(theme::red())
+                            .child(SharedString::from(format!("• {blocker}"))),
+                    );
+                }
+                for name in status.pending_checks.iter().take(4) {
+                    area = area.child(
+                        div()
+                            .pl_2()
+                            .text_size(px(11.))
+                            .text_color(theme::peach())
+                            .child(SharedString::from(format!("waiting: {name}"))),
+                    );
+                }
+                for name in status.failing_checks.iter().take(4) {
+                    area = area.child(
+                        div()
+                            .pl_2()
+                            .text_size(px(11.))
+                            .text_color(theme::red())
+                            .child(SharedString::from(format!("failed: {name}"))),
+                    );
+                }
+                (blockers.is_empty(), area.into_any_element())
+            }
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(120.))
+            .bg(theme::palette_backdrop())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.close_merge(window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .w(px(560.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                        this.close_merge(window, cx);
+                    }))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme::surface0())
+                    .bg(theme::mantle())
+                    .shadow_lg()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .text_size(px(12.))
+                    .child(
+                        div()
+                            .text_color(theme::overlay0())
+                            .child(SharedString::from("Merge pull request")),
+                    )
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from(format!(
+                                "#{} {}",
+                                meta.number, meta.title
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme::subtext())
+                            .child(SharedString::from(format!(
+                                "{} → {}",
+                                meta.head_ref_name, meta.base_ref_name
+                            ))),
+                    )
+                    .child(status_area)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(method_option("Merge commit", gh::MergeMethod::Merge))
+                            .child(method_option("Squash", gh::MergeMethod::Squash))
+                            .child(method_option("Rebase", gh::MergeMethod::Rebase)),
+                    )
+                    .child(
+                        div()
+                            .id("merge-delete-branch")
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(merge) = &mut this.merge {
+                                    merge.delete_branch = !merge.delete_branch;
+                                    cx.notify();
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .w(px(16.))
+                                    .h(px(16.))
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(theme::surface0())
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(theme::green())
+                                    .child(SharedString::from(if merge.delete_branch {
+                                        "✓"
+                                    } else {
+                                        ""
+                                    })),
+                            )
+                            .child(SharedString::from("Delete branch after merge")),
+                    )
+                    .when_some(merge.error.clone(), |card, err| {
+                        card.child(div().text_color(theme::red()).child(err))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(11.))
+                                    .text_color(theme::overlay0())
+                                    .child(SharedString::from(
+                                        "GitHub will enforce branch protection",
+                                    )),
+                            )
+                            .child(
+                                Button::new("merge-cancel")
+                                    .label("Cancel")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_merge(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("merge-confirm")
+                                    .label("Merge pull request")
+                                    .primary()
+                                    .small()
+                                    .disabled(!can_merge || merge.in_flight)
+                                    .loading(merge.in_flight)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_merge(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The minimap column: precomputed, coalesced quad runs plus one
     /// per-frame viewport rectangle, painted straight into a canvas (no text,
     /// no per-row elements). Mouse-downs stop propagation here so the pane's
@@ -5311,6 +5991,132 @@ impl ReviewApp {
                         .child(note),
                 )
             })
+    }
+
+    fn render_user_pr_selector(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let query = self.open_input.read(cx).value().to_string();
+        let filtered = filter_user_prs(&self.user_prs, &query);
+        let count = filtered.len();
+        let entity = cx.entity();
+        let expanded = self.user_prs_expanded;
+        let loading = self.user_prs_loading;
+        let error = self.user_prs_error.clone();
+        let total = self.user_prs.len();
+
+        let header = div()
+            .h(px(30.))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id("toggle-user-prs")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.user_prs_expanded = !this.user_prs_expanded;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .text_color(theme::overlay0())
+                            .child(SharedString::from(if expanded { "▾" } else { "▸" })),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme::subtext())
+                            .child(SharedString::from(format!("Pull requests ({total})"))),
+                    ),
+            )
+            .child(
+                Button::new("refresh-user-prs")
+                    .icon(IconName::Redo)
+                    .loading(loading)
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_user_prs(cx))),
+            );
+
+        let body: gpui::AnyElement = if !expanded {
+            div().into_any_element()
+        } else if self.user_prs.is_empty() && loading {
+            div()
+                .px_3()
+                .py_2()
+                .text_color(theme::overlay0())
+                .child(SharedString::from("loading pull requests…"))
+                .into_any_element()
+        } else if self.user_prs.is_empty() {
+            match error.clone() {
+                Some(err) => div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(11.))
+                    .text_color(theme::red())
+                    .child(err)
+                    .into_any_element(),
+                None => div()
+                    .px_3()
+                    .py_2()
+                    .text_color(theme::overlay0())
+                    .child(SharedString::from("no open pull requests"))
+                    .into_any_element(),
+            }
+        } else if count == 0 {
+            div()
+                .px_3()
+                .py_2()
+                .text_color(theme::overlay0())
+                .child(SharedString::from("no matching pull requests"))
+                .into_any_element()
+        } else {
+            div()
+                .h(px(count.min(5) as f32 * USER_PR_ROW_HEIGHT))
+                .child(
+                    uniform_list("user-pr-list", count, move |range, _window, cx| {
+                        let this = entity.read(cx);
+                        range
+                            .filter_map(|pos| {
+                                Some((pos, this.user_prs.get(*filtered.get(pos)?)?))
+                            })
+                            .map(|(pos, pr)| render_user_pr_row(pr, pos, entity.clone()))
+                            .collect()
+                    })
+                    .track_scroll(self.user_prs_scroll.clone())
+                    .h_full(),
+                )
+                .into_any_element()
+        };
+
+        div()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::surface0())
+            .child(header)
+            .child(body)
+            .when(expanded && !self.user_prs.is_empty(), |section| {
+                section.when_some(error, |section, err| {
+                    section.child(
+                        div()
+                            .px_3()
+                            .pb_1()
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(theme::red())
+                            .child(err),
+                    )
+                })
+            })
+            .into_any_element()
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5530,6 +6336,7 @@ impl ReviewApp {
                         )
                     }),
             )
+            .child(self.render_user_pr_selector(cx))
             .child(list)
             .child(div().h(px(1.)).flex_shrink_0().bg(theme::surface0()))
             .child(
@@ -6083,6 +6890,9 @@ impl Render for ReviewApp {
             .when(self.review.is_some(), |root| {
                 root.child(self.render_review(cx))
             })
+            .when(self.merge.is_some(), |root| {
+                root.child(self.render_merge(cx))
+            })
             .when(self.palette.is_some(), |root| {
                 root.child(self.render_palette(cx))
             })
@@ -6516,6 +7326,21 @@ mod tests {
         }
     }
 
+    fn user_pr(repo: &str, number: u64, title: &str, author: &str) -> gh::UserPrSummary {
+        gh::UserPrSummary {
+            number,
+            title: title.to_string(),
+            author: gh::Author { login: author.to_string() },
+            is_draft: false,
+            updated_at: "2026-07-01T00:00:00Z".to_string(),
+            repository: gh::Repository {
+                name: repo.rsplit('/').next().unwrap().to_string(),
+                name_with_owner: repo.to_string(),
+            },
+            url: format!("https://github.com/{repo}/pull/{number}"),
+        }
+    }
+
     #[test]
     fn pr_filter_empty_query_keeps_original_order() {
         let all = vec![
@@ -6537,6 +7362,54 @@ mod tests {
         assert_eq!(filter_prs(&all, "bob"), vec![1]);
         assert_eq!(filter_prs(&all, "crash"), vec![0]);
         assert!(filter_prs(&all, "zzzqqq").is_empty());
+    }
+
+    #[test]
+    fn user_pr_filter_matches_repo_number_title_and_author() {
+        let all = vec![
+            user_pr("ellie/lgtm", 3, "fix crash", "alice"),
+            user_pr("zed-industries/zed", 10, "add selector", "bob"),
+        ];
+        assert_eq!(filter_user_prs(&all, ""), vec![0, 1]);
+        assert_eq!(filter_user_prs(&all, "ellie"), vec![0]);
+        assert_eq!(filter_user_prs(&all, "#10"), vec![1]);
+        assert_eq!(filter_user_prs(&all, "selector"), vec![1]);
+        assert_eq!(filter_user_prs(&all, "alice"), vec![0]);
+        assert!(filter_user_prs(&all, "zzzqqq").is_empty());
+    }
+
+    #[test]
+    fn existing_pr_lookup_prevents_duplicate_open_items() {
+        let items = vec![
+            ReviewItem {
+                id: 1,
+                source: Source::Pr(gh::PrLocator {
+                    owner: "ellie".to_string(),
+                    repo: "lgtm".to_string(),
+                    number: 8,
+                }),
+                state: ItemState::Loading,
+                reloading: false,
+                refresh_error: None,
+                upgrade_gen: 0,
+            },
+            ReviewItem {
+                id: 2,
+                source: Source::Local(git::LocalSource {
+                    branch: "feature".to_string(),
+                    base_label: "main".to_string(),
+                    base_oid: None,
+                    repo_root: std::path::PathBuf::from("/tmp/repo"),
+                }),
+                state: ItemState::Loading,
+                reloading: false,
+                refresh_error: None,
+                upgrade_gen: 0,
+            },
+        ];
+        assert_eq!(find_open_pr_item(&items, "ellie/lgtm", 8), Some(0));
+        assert_eq!(find_open_pr_item(&items, "ellie/lgtm", 9), None);
+        assert_eq!(find_open_pr_item(&items, "invalid", 8), None);
     }
 
     /// (depth, display name, Some(file_ix) for files / None for dirs).
@@ -7550,6 +8423,27 @@ mod tests {
         );
         assert!(!root.join("big.rs").exists());
         assert!(!root.parent().unwrap().join("escape.rs").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn preview_session_cleanup_removes_current_and_dead_processes_only() {
+        let root = std::env::temp_dir().join(format!(
+            "lgtm-preview-cleanup-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["100", "200", "300", "not-a-pid"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+
+        cleanup_stale_preview_sessions(&root, 100, |pid| pid == 200);
+
+        assert!(!root.join("100").exists());
+        assert!(root.join("200").exists());
+        assert!(!root.join("300").exists());
+        assert!(root.join("not-a-pid").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

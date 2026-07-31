@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -162,6 +163,67 @@ pub fn list_prs(owner: &str, repo: &str) -> Result<Vec<PrSummary>> {
     serde_json::from_str(&json).context("unexpected gh pr list JSON")
 }
 
+/// One row of `gh search prs` output for the signed-in user's sidebar list.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPrSummary {
+    pub number: u64,
+    pub title: String,
+    pub author: Author,
+    pub is_draft: bool,
+    pub updated_at: String,
+    pub repository: Repository,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Repository {
+    pub name: String,
+    pub name_with_owner: String,
+}
+
+fn search_user_prs(filter: &str) -> Result<Vec<UserPrSummary>> {
+    let json = gh(&[
+        "search", "prs", filter, "--state=open", "--limit=200",
+        "--sort=updated", "--order=desc",
+        "--json=number,title,author,isDraft,updatedAt,repository,url",
+    ])?;
+    serde_json::from_str(&json).context("unexpected gh search prs JSON")
+}
+
+fn merge_user_prs(
+    authored: Vec<UserPrSummary>,
+    review_requested: Vec<UserPrSummary>,
+) -> Vec<UserPrSummary> {
+    let mut by_id: HashMap<(String, u64), UserPrSummary> = HashMap::new();
+    for pr in authored.into_iter().chain(review_requested) {
+        let key = (pr.repository.name_with_owner.clone(), pr.number);
+        match by_id.get(&key) {
+            Some(existing) if existing.updated_at >= pr.updated_at => {}
+            _ => {
+                by_id.insert(key, pr);
+            }
+        }
+    }
+    let mut merged: Vec<_> = by_id.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.repository.name_with_owner.cmp(&b.repository.name_with_owner))
+            .then_with(|| a.number.cmp(&b.number))
+    });
+    merged
+}
+
+/// Open PRs authored by the signed-in user or requesting their review,
+/// across every repository visible to their `gh` login.
+pub fn list_user_prs() -> Result<Vec<UserPrSummary>> {
+    let authored = search_user_prs("--author=@me")?;
+    let review_requested = search_user_prs("--review-requested=@me")?;
+    Ok(merge_user_prs(authored, review_requested))
+}
+
 /// One PR review comment from the REST pulls/comments API. Unlike `gh pr
 /// view --json` (camelCase), this endpoint returns snake_case field names, so
 /// no `rename_all` here.
@@ -264,6 +326,191 @@ pub fn submit_review(loc: &PrLocator, verdict: ReviewVerdict, body: &str) -> Res
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Merge => "--merge",
+            Self::Squash => "--squash",
+            Self::Rebase => "--rebase",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MergeStatus {
+    pub is_draft: bool,
+    pub mergeable: String,
+    pub merge_state_status: String,
+    pub review_decision: String,
+    pub head_ref_oid: String,
+    pub passing_checks: usize,
+    pub pending_checks: Vec<String>,
+    pub failing_checks: Vec<String>,
+}
+
+impl MergeStatus {
+    pub fn blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if self.is_draft {
+            blockers.push("pull request is still a draft".to_string());
+        }
+        if self.review_decision != "APPROVED" {
+            blockers.push("pull request does not have an approval".to_string());
+        }
+        match self.mergeable.as_str() {
+            "MERGEABLE" => {}
+            "CONFLICTING" => blockers.push("branch has merge conflicts".to_string()),
+            _ => blockers.push("GitHub has not confirmed mergeability".to_string()),
+        }
+        if !self.pending_checks.is_empty() {
+            blockers.push(format!(
+                "{} check{} still running",
+                self.pending_checks.len(),
+                if self.pending_checks.len() == 1 { "" } else { "s" }
+            ));
+        }
+        if !self.failing_checks.is_empty() {
+            blockers.push(format!(
+                "{} check{} failed",
+                self.failing_checks.len(),
+                if self.failing_checks.len() == 1 { "" } else { "s" }
+            ));
+        }
+        blockers
+    }
+
+    pub fn can_merge(&self) -> bool {
+        self.blockers().is_empty()
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMergeStatus {
+    is_draft: bool,
+    mergeable: String,
+    merge_state_status: String,
+    #[serde(default)]
+    review_decision: String,
+    head_ref_oid: String,
+    #[serde(default)]
+    status_check_rollup: Vec<serde_json::Value>,
+}
+
+fn normalize_merge_status(raw: RawMergeStatus) -> MergeStatus {
+    let mut passing_checks = 0;
+    let mut pending_checks = Vec::new();
+    let mut failing_checks = Vec::new();
+    for check in raw.status_check_rollup {
+        let kind = check.get("__typename").and_then(|v| v.as_str()).unwrap_or("");
+        let name = check
+            .get("name")
+            .or_else(|| check.get("context"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown check")
+            .to_string();
+        match kind {
+            "CheckRun" => {
+                let status = check.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                let conclusion =
+                    check.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+                if status != "COMPLETED" {
+                    pending_checks.push(name);
+                } else if matches!(conclusion, "SUCCESS" | "NEUTRAL" | "SKIPPED") {
+                    passing_checks += 1;
+                } else {
+                    failing_checks.push(name);
+                }
+            }
+            "StatusContext" => match check.get("state").and_then(|v| v.as_str()).unwrap_or("") {
+                "SUCCESS" => passing_checks += 1,
+                "PENDING" | "EXPECTED" => pending_checks.push(name),
+                _ => failing_checks.push(name),
+            },
+            _ => pending_checks.push(name),
+        }
+    }
+    MergeStatus {
+        is_draft: raw.is_draft,
+        mergeable: raw.mergeable,
+        merge_state_status: raw.merge_state_status,
+        review_decision: raw.review_decision,
+        head_ref_oid: raw.head_ref_oid,
+        passing_checks,
+        pending_checks,
+        failing_checks,
+    }
+}
+
+pub fn fetch_merge_status(loc: &PrLocator) -> Result<MergeStatus> {
+    let json = gh(&[
+        "pr",
+        "view",
+        &loc.number.to_string(),
+        "--repo",
+        &loc.repo_slug(),
+        "--json",
+        "isDraft,mergeable,mergeStateStatus,reviewDecision,headRefOid,statusCheckRollup",
+    ])?;
+    let raw: RawMergeStatus =
+        serde_json::from_str(&json).context("unexpected gh pr merge-status JSON")?;
+    Ok(normalize_merge_status(raw))
+}
+
+fn merge_args(
+    loc: &PrLocator,
+    method: MergeMethod,
+    delete_branch: bool,
+    head_oid: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "merge".to_string(),
+        loc.number.to_string(),
+        "--repo".to_string(),
+        loc.repo_slug(),
+        method.flag().to_string(),
+        "--match-head-commit".to_string(),
+        head_oid.to_string(),
+    ];
+    if delete_branch {
+        args.push("--delete-branch".to_string());
+    }
+    args
+}
+
+pub fn merge_pr(
+    loc: &PrLocator,
+    method: MergeMethod,
+    delete_branch: bool,
+    head_oid: &str,
+) -> Result<()> {
+    let args = merge_args(loc, method, delete_branch, head_oid);
+    // Run outside the app's source workspace. With --delete-branch, gh may
+    // also delete a matching local branch when its current directory is a
+    // clone of the target repository.
+    let output = Command::new("gh")
+        .args(&args)
+        .current_dir(std::env::temp_dir())
+        .output()
+        .map_err(|err| anyhow!("failed to run gh (is the GitHub CLI installed?): {err}"))?;
+    if !output.status.success() {
+        bail!(
+            "gh {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Reply to the review thread rooted at `comment_id`.
 pub fn post_reply(loc: &PrLocator, comment_id: u64, body: &str) -> Result<()> {
     gh(&[
@@ -290,6 +537,72 @@ pub fn fetch_patch(loc: &PrLocator) -> Result<String> {
     ])
 }
 
+/// GitHub refuses to serve one combined patch after its hosted diff limits
+/// are reached. Keep other `gh pr diff` failures on their normal error path.
+pub fn is_diff_too_large_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_lowercase();
+    message.contains("diff too large")
+        || message.contains("diff is too large")
+        || message.contains("diff too big")
+        || message.contains("diff exceeded the maximum")
+        || message.contains("pullrequest.diff too_large")
+}
+
+/// Fetch a large PR through Git into an app-owned bare partial clone, then
+/// build the same merge-base-to-head patch locally. `preview_root` must be
+/// unique to one open app item; the app owns its cleanup.
+pub fn fetch_patch_locally(
+    loc: &PrLocator,
+    meta: &PrMeta,
+    preview_root: &std::path::Path,
+) -> Result<String> {
+    if preview_root.exists() {
+        std::fs::remove_dir_all(preview_root)
+            .with_context(|| format!("couldn't reset preview {}", preview_root.display()))?;
+    }
+    std::fs::create_dir_all(preview_root)
+        .with_context(|| format!("couldn't create preview {}", preview_root.display()))?;
+    let repo = preview_root.join("repo.git");
+    let repo_path = repo.to_string_lossy().into_owned();
+    let clone = Command::new("gh")
+        .args([
+            "repo",
+            "clone",
+            &loc.repo_slug(),
+            &repo_path,
+            "--",
+            "--bare",
+            "--filter=blob:none",
+            "--single-branch",
+            "--no-tags",
+        ])
+        .output()
+        .map_err(|err| anyhow!("failed to run gh (is the GitHub CLI installed?): {err}"))?;
+    if !clone.status.success() {
+        bail!(
+            "gh repo clone {} failed: {}",
+            loc.repo_slug(),
+            String::from_utf8_lossy(&clone.stderr).trim()
+        );
+    }
+
+    let base_ref = format!("+refs/heads/{}:refs/lgtm/base", meta.base_ref_name);
+    let head_ref = format!("+refs/pull/{}/head:refs/lgtm/head", loc.number);
+    git(&repo, &["fetch", "--no-tags", "origin", &base_ref, &head_ref])?;
+    let merge_base = git(&repo, &["merge-base", "refs/lgtm/base", "refs/lgtm/head"])?;
+    git(
+        &repo,
+        &[
+            "diff",
+            "-M",
+            "--no-color",
+            "--no-ext-diff",
+            merge_base.trim(),
+            "refs/lgtm/head",
+        ],
+    )
+}
+
 /// Blob-size cap: PR review never needs multi-megabyte files, and the raw
 /// contents API happily serves up to 100 MB.
 const MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -301,7 +614,27 @@ const MAX_BLOB_BYTES: usize = 1024 * 1024;
 /// `~/.cache/lgtm/blobs/` (sha256 of `repo\0oid\0path`, with an `.absent`
 /// sidecar marking negative entries).
 pub fn fetch_file_at(loc: &PrLocator, commit_oid: &str, path: &str) -> Result<Option<String>> {
-    let cache = cache_path(&loc.repo_slug(), commit_oid, path);
+    fetch_file_at_with_cache(loc, commit_oid, path, None)
+}
+
+/// The same immutable blob fetch, but with an item-owned cache directory that
+/// can be removed when its preview closes.
+pub fn fetch_file_at_in(
+    loc: &PrLocator,
+    commit_oid: &str,
+    path: &str,
+    cache_root: &std::path::Path,
+) -> Result<Option<String>> {
+    fetch_file_at_with_cache(loc, commit_oid, path, Some(cache_root))
+}
+
+fn fetch_file_at_with_cache(
+    loc: &PrLocator,
+    commit_oid: &str,
+    path: &str,
+    cache_root: Option<&std::path::Path>,
+) -> Result<Option<String>> {
+    let cache = cache_path(cache_root, &loc.repo_slug(), commit_oid, path);
     if let Some(cache) = &cache {
         if cache.with_extension("absent").exists() {
             return Ok(None);
@@ -352,11 +685,14 @@ fn mark_absent(cache: Option<PathBuf>) {
 
 /// `~/.cache/lgtm/blobs/<key>`, creating the directory; None when HOME is
 /// unset or the directory can't be created (cache disabled, fetch still works).
-fn cache_path(repo: &str, oid: &str, path: &str) -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var_os("HOME")?)
-        .join(".cache")
-        .join("lgtm")
-        .join("blobs");
+fn cache_path(root: Option<&std::path::Path>, repo: &str, oid: &str, path: &str) -> Option<PathBuf> {
+    let dir = match root {
+        Some(root) => root.to_path_buf(),
+        None => PathBuf::from(std::env::var_os("HOME")?)
+            .join(".cache")
+            .join("lgtm")
+            .join("blobs"),
+    };
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join(cache_key(repo, oid, path)))
 }
@@ -406,9 +742,41 @@ fn gh(args: &[&str]) -> Result<String> {
     String::from_utf8(output.stdout).context("gh output was not UTF-8")
 }
 
+fn git(repo: &std::path::Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|err| anyhow!("failed to run git (is git installed?): {err}"))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("git output was not UTF-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user_pr(repo: &str, number: u64, updated_at: &str) -> UserPrSummary {
+        UserPrSummary {
+            number,
+            title: format!("PR {number}"),
+            author: Author { login: "alice".to_string() },
+            is_draft: false,
+            updated_at: updated_at.to_string(),
+            repository: Repository {
+                name: repo.rsplit('/').next().unwrap().to_string(),
+                name_with_owner: repo.to_string(),
+            },
+            url: format!("https://github.com/{repo}/pull/{number}"),
+        }
+    }
 
     #[test]
     fn parses_slug_form() {
@@ -429,6 +797,84 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(resolve_pr_arg("not-a-pr").is_err());
+    }
+
+    #[test]
+    fn recognizes_only_large_diff_errors_for_local_fallback() {
+        assert!(is_diff_too_large_error(&anyhow!(
+            "gh pr diff failed: HTTP 406: Diff too large"
+        )));
+        assert!(is_diff_too_large_error(&anyhow!("diff is too large to render")));
+        assert!(is_diff_too_large_error(&anyhow!(
+            "HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)\n\
+             PullRequest.diff too_large"
+        )));
+        assert!(!is_diff_too_large_error(&anyhow!("HTTP 401: Bad credentials")));
+        assert!(!is_diff_too_large_error(&anyhow!("network connection failed")));
+    }
+
+    #[test]
+    fn merge_status_normalizes_checks_and_reports_blockers() {
+        let json = r#"{
+            "isDraft": false,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "BLOCKED",
+            "reviewDecision": "APPROVED",
+            "headRefOid": "abc123",
+            "statusCheckRollup": [
+                {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"__typename":"CheckRun","name":"lint","status":"IN_PROGRESS","conclusion":""},
+                {"__typename":"StatusContext","context":"deploy","state":"FAILURE"}
+            ]
+        }"#;
+        let raw: RawMergeStatus = serde_json::from_str(json).unwrap();
+        let status = normalize_merge_status(raw);
+        assert_eq!(status.passing_checks, 1);
+        assert_eq!(status.pending_checks, vec!["lint"]);
+        assert_eq!(status.failing_checks, vec!["deploy"]);
+        assert_eq!(
+            status.blockers(),
+            vec!["1 check still running", "1 check failed"]
+        );
+        assert!(!status.can_merge());
+    }
+
+    #[test]
+    fn merge_status_blocks_drafts_unapproved_and_conflicting_prs() {
+        let status = MergeStatus {
+            is_draft: true,
+            mergeable: "CONFLICTING".to_string(),
+            merge_state_status: "DIRTY".to_string(),
+            review_decision: String::new(),
+            head_ref_oid: "abc123".to_string(),
+            passing_checks: 2,
+            pending_checks: Vec::new(),
+            failing_checks: Vec::new(),
+        };
+        assert_eq!(
+            status.blockers(),
+            vec![
+                "pull request is still a draft",
+                "pull request does not have an approval",
+                "branch has merge conflicts",
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_arguments_include_method_head_guard_and_optional_delete() {
+        let loc = PrLocator {
+            owner: "ellie".to_string(),
+            repo: "lgtm".to_string(),
+            number: 8,
+        };
+        assert_eq!(
+            merge_args(&loc, MergeMethod::Squash, true, "abc123"),
+            vec![
+                "pr", "merge", "8", "--repo", "ellie/lgtm", "--squash",
+                "--match-head-commit", "abc123", "--delete-branch",
+            ]
+        );
     }
 
     #[test]
@@ -479,6 +925,49 @@ mod tests {
         let json = json.replace(r#", "reviewDecision": "CHANGES_REQUESTED""#, "");
         let meta: PrMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(meta.review_decision, "");
+    }
+
+    #[test]
+    fn deserializes_user_pr_with_repository_identity() {
+        let json = r#"{
+            "number": 8,
+            "title": "Add selector",
+            "author": {"login": "alice"},
+            "isDraft": true,
+            "updatedAt": "2026-07-28T10:48:41Z",
+            "repository": {"name": "lgtm", "nameWithOwner": "ellie/lgtm"},
+            "url": "https://github.com/ellie/lgtm/pull/8"
+        }"#;
+        let pr: UserPrSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(pr.repository.name, "lgtm");
+        assert_eq!(pr.repository.name_with_owner, "ellie/lgtm");
+        assert_eq!(pr.number, 8);
+        assert!(pr.is_draft);
+    }
+
+    #[test]
+    fn merges_user_prs_without_duplicates_and_sorts_latest_first() {
+        let authored = vec![
+            user_pr("ellie/lgtm", 1, "2026-07-20T00:00:00Z"),
+            user_pr("ellie/lgtm", 2, "2026-07-25T00:00:00Z"),
+        ];
+        let requested = vec![
+            user_pr("ellie/lgtm", 1, "2026-07-21T00:00:00Z"),
+            user_pr("zed-industries/zed", 3, "2026-07-30T00:00:00Z"),
+        ];
+        let merged = merge_user_prs(authored, requested);
+        let ids: Vec<_> = merged.iter()
+            .map(|pr| (pr.repository.name_with_owner.as_str(), pr.number))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("zed-industries/zed", 3),
+                ("ellie/lgtm", 2),
+                ("ellie/lgtm", 1),
+            ]
+        );
+        assert_eq!(merged[2].updated_at, "2026-07-21T00:00:00Z");
     }
 
     #[test]
